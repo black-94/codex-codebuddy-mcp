@@ -216,3 +216,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local environment files (keep the shareable template tracked)
+.env.*
+!.env.example
+
+# macOS metadata
+.DS_Store
+
+# Local MCP development state
+.mcp/
+.codex/

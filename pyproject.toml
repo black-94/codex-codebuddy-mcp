@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "codex-codebuddy-mcp"
+version = "0.1.0"
+description = "A minimal MCP bridge from Codex to CodeBuddy Code's ACP server"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+dependencies = [
+  "mcp>=1.30,<2",
+]
+
+[project.scripts]
+codex-codebuddy-mcp = "codex_codebuddy_mcp.server:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.25",
+  "ruff>=0.11",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codex_codebuddy_mcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+  "real_codebuddy: uses an installed CodeBuddy Code executable",
+  "model: sends a real model prompt and may consume account quota",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
