@@ -1,0 +1,5 @@
+# Default bridge limits. Values are bytes.
+max_read: 1048576
+max_output: 65536
+max_concurrency: 2
+approval_mode: elicitation

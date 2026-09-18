@@ -9,6 +9,7 @@ import sys
 
 pending_prompt_id: int | str | None = None
 pending_session_id: str | None = None
+current_model_id = "fake-model-id"
 
 
 def send(message: dict) -> None:
@@ -32,20 +33,38 @@ for raw_line in sys.stdin:
                     "agentCapabilities": {},
                     "agentInfo": {"name": "fake-codebuddy", "version": "1"},
                     "authMethods": [{"id": "external", "name": "External"}],
+                    "models": {
+                        "availableModels": [
+                            {"modelId": "fake-model-id", "name": "Fake Model"},
+                            {"modelId": "fake-fast-id", "name": "Fake Fast Model"},
+                        ],
+                        "currentModelId": current_model_id,
+                    },
                 },
             }
         )
     elif method == "authenticate":
         send({"jsonrpc": "2.0", "id": request_id, "result": {}})
     elif method == "_codebuddy.ai/getUserInfo":
-        user_info = {"userId": "fake-user"} if os.environ.get("FAKE_AUTHENTICATED") != "0" else None
-        send(
-            {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {"userInfo": user_info},
-            }
-        )
+        if os.environ.get("FAKE_USER_INFO_UNSUPPORTED") == "1":
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32601, "message": "Method not found"},
+                }
+            )
+        else:
+            user_info = (
+                {"userId": "fake-user"} if os.environ.get("FAKE_AUTHENTICATED") != "0" else None
+            )
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {"userInfo": user_info},
+                }
+            )
     elif method == "session/new":
         pending_session_id = f"fake-session-{os.getpid()}"
         send(
@@ -57,16 +76,44 @@ for raw_line in sys.stdin:
         )
     elif method == "session/load":
         pending_session_id = params["sessionId"]
+        result = {}
+        if os.environ.get("FAKE_LOAD_OMIT_SESSION_ID") != "1":
+            result["sessionId"] = pending_session_id
         send(
             {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": {"sessionId": pending_session_id},
+                "result": result,
             }
         )
+    elif method == "session/set_model":
+        requested_model_id = params.get("modelId")
+        if requested_model_id == "unknown-model":
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32602, "message": "Unknown model"},
+                }
+            )
+        else:
+            current_model_id = requested_model_id
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {"modelId": current_model_id},
+                }
+            )
     elif method == "session/prompt":
         prompt = params["prompt"][0]["text"]
         session_id = params["sessionId"]
+        response_text = f"echo:{prompt}"
+        if prompt == "large-output":
+            response_text = "x" * 10000
+        if prompt == "large-stderr":
+            sys.stderr.write("e" * 10000 + "\n")
+            sys.stderr.flush()
         send(
             {
                 "jsonrpc": "2.0",
@@ -75,7 +122,7 @@ for raw_line in sys.stdin:
                     "sessionId": session_id,
                     "update": {
                         "sessionUpdate": "agent_message_chunk",
-                        "content": {"type": "text", "text": f"echo:{prompt}"},
+                        "content": {"type": "text", "text": response_text},
                     },
                 },
             }
