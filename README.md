@@ -218,12 +218,25 @@ uv run pytest
 
 The handshake starts the actual `codebuddy-code` binary, validates ACP initialization and login
 state handling, and creates an ACP session when the installed CLI is already authenticated. It does
-not send a model prompt or consume model quota. It skips only when `codebuddy` is not installed.
+not send a model prompt or consume model quota. A second real startup test verifies that the default
+permission mode passed to CodeBuddy is `auto`, rather than `plan`. These tests skip only when
+`codebuddy` is not installed.
 
 An opt-in end-to-end model test is also provided. It sends a real prompt and may consume quota:
 
 ```bash
 RUN_CODEBUDDY_MODEL_TEST=1 uv run pytest -m model
+```
+
+The real permission-forwarding test is parameterized over both supported forwarding modes. It
+prompts CodeBuddy to request approval for a harmless `printf` through Bash, verifies either the
+compatible two-step response or MCP elicitation, selects an allow option, and checks that the same
+turn completes. It is separately opt-in because each mode sends a model prompt and executes the
+approved command:
+
+```bash
+RUN_CODEBUDDY_PERMISSION_TEST=1 uv run pytest \
+  tests/test_server.py::test_real_codebuddy_permission_request_is_forwarded
 ```
 
 Run static checks:
