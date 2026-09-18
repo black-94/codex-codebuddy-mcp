@@ -11,9 +11,16 @@ DEFAULT_MAX_OUTPUT = 64 * 1024
 DEFAULT_MAX_CONCURRENCY = 2
 DEFAULT_APPROVAL_MODE = "elicitation"
 DEFAULT_TURN_TIMEOUT_SECONDS = 900.0
+DEFAULT_STARTUP_TIMEOUT_SECONDS = 60.0
+DEFAULT_TURN_CANCEL_TIMEOUT_SECONDS = 5.0
+DEFAULT_LOCAL_PROCESS_TERMINATE_TIMEOUT_SECONDS = 5.0
+DEFAULT_REMOTE_SSH_CLEANUP_TIMEOUT_SECONDS = 10.0
+DEFAULT_STDOUT_OVERFLOW_RETRY_TOLERANCE = 1
+DEFAULT_STDERR_TAIL_BUFFER_SIZE = 80
 APPROVAL_MODES = {"elicitation", "compatible"}
 CONFIG_ENV = "CODEX_CODEBUDDY_MCP_CONFIG"
 _SIZE_VALUE = re.compile(r"^(?P<number>[0-9]+)\s*(?P<unit>b|kb|kib|mb|mib|gb|gib)?$", re.IGNORECASE)
+_SECONDS_VALUE = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
 _SIZE_MULTIPLIERS = {
     "b": 1,
     "kb": 1024,
@@ -24,8 +31,19 @@ _SIZE_MULTIPLIERS = {
     "gib": 1024 * 1024 * 1024,
 }
 _BYTE_KEYS = {"max_read", "max_output"}
-_PLAIN_INTEGER_KEYS = {"max_concurrency"}
-_KNOWN_KEYS = _BYTE_KEYS | _PLAIN_INTEGER_KEYS | {"approval_mode"}
+_PLAIN_INTEGER_KEYS = {
+    "max_concurrency",
+    "stdout_overflow_retry_tolerance",
+    "stderr_tail_buffer_size",
+}
+_SECONDS_KEYS = {
+    "timeout_seconds",
+    "startup_timeout_seconds",
+    "turn_cancel_timeout_seconds",
+    "local_process_terminate_timeout_seconds",
+    "remote_ssh_cleanup_timeout_seconds",
+}
+_KNOWN_KEYS = _BYTE_KEYS | _PLAIN_INTEGER_KEYS | _SECONDS_KEYS | {"approval_mode"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +52,15 @@ class BridgeDefaults:
     max_output: int = DEFAULT_MAX_OUTPUT
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY
     approval_mode: str = DEFAULT_APPROVAL_MODE
+    timeout_seconds: float = DEFAULT_TURN_TIMEOUT_SECONDS
+    startup_timeout_seconds: float = DEFAULT_STARTUP_TIMEOUT_SECONDS
+    turn_cancel_timeout_seconds: float = DEFAULT_TURN_CANCEL_TIMEOUT_SECONDS
+    local_process_terminate_timeout_seconds: float = (
+        DEFAULT_LOCAL_PROCESS_TERMINATE_TIMEOUT_SECONDS
+    )
+    remote_ssh_cleanup_timeout_seconds: float = DEFAULT_REMOTE_SSH_CLEANUP_TIMEOUT_SECONDS
+    stdout_overflow_retry_tolerance: int = DEFAULT_STDOUT_OVERFLOW_RETRY_TOLERANCE
+    stderr_tail_buffer_size: int = DEFAULT_STDERR_TAIL_BUFFER_SIZE
 
 
 def _validate_positive_int(data: dict[str, Any], key: str, fallback: int) -> int:
@@ -41,6 +68,20 @@ def _validate_positive_int(data: dict[str, Any], key: str, fallback: int) -> int
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{key} must be a positive integer in the MCP YAML config")
     return value
+
+
+def _validate_nonnegative_int(data: dict[str, Any], key: str, fallback: int) -> int:
+    value = data.get(key, fallback)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{key} must be a non-negative integer in the MCP YAML config")
+    return value
+
+
+def _validate_positive_seconds(data: dict[str, Any], key: str, fallback: float) -> float:
+    value = data.get(key, fallback)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise ValueError(f"{key} must be positive in the MCP YAML config")
+    return float(value)
 
 
 def _config_path() -> Path | None:
@@ -72,6 +113,33 @@ def load_defaults() -> BridgeDefaults:
         max_output=_validate_positive_int(raw, "max_output", DEFAULT_MAX_OUTPUT),
         max_concurrency=_validate_positive_int(raw, "max_concurrency", DEFAULT_MAX_CONCURRENCY),
         approval_mode=_validate_approval_mode(raw.get("approval_mode", DEFAULT_APPROVAL_MODE)),
+        timeout_seconds=_validate_positive_seconds(
+            raw, "timeout_seconds", DEFAULT_TURN_TIMEOUT_SECONDS
+        ),
+        startup_timeout_seconds=_validate_positive_seconds(
+            raw, "startup_timeout_seconds", DEFAULT_STARTUP_TIMEOUT_SECONDS
+        ),
+        turn_cancel_timeout_seconds=_validate_positive_seconds(
+            raw, "turn_cancel_timeout_seconds", DEFAULT_TURN_CANCEL_TIMEOUT_SECONDS
+        ),
+        local_process_terminate_timeout_seconds=_validate_positive_seconds(
+            raw,
+            "local_process_terminate_timeout_seconds",
+            DEFAULT_LOCAL_PROCESS_TERMINATE_TIMEOUT_SECONDS,
+        ),
+        remote_ssh_cleanup_timeout_seconds=_validate_positive_seconds(
+            raw,
+            "remote_ssh_cleanup_timeout_seconds",
+            DEFAULT_REMOTE_SSH_CLEANUP_TIMEOUT_SECONDS,
+        ),
+        stdout_overflow_retry_tolerance=_validate_nonnegative_int(
+            raw,
+            "stdout_overflow_retry_tolerance",
+            DEFAULT_STDOUT_OVERFLOW_RETRY_TOLERANCE,
+        ),
+        stderr_tail_buffer_size=_validate_positive_int(
+            raw, "stderr_tail_buffer_size", DEFAULT_STDERR_TAIL_BUFFER_SIZE
+        ),
     )
 
 
@@ -87,8 +155,9 @@ def _parse_yaml_mapping(text: str) -> dict[str, Any]:
 
     Keeping this parser dependency-free is useful for an MCP process launched
     directly by a host. The supported YAML subset is blank/comment lines and
-    ``key: integer`` or ``key: integer+unit`` entries, which covers the public
-    configuration contract (for example ``max_read: 1MB``).
+    ``key: integer``, ``key: number-of-seconds`` or ``key: integer+unit``
+    entries, which covers the public configuration contract (for example
+    ``max_read: 1MB``).
     """
     result: dict[str, Any] = {}
     for line_number, line in enumerate(text.splitlines(), 1):
@@ -115,6 +184,13 @@ def _parse_yaml_mapping(text: str) -> dict[str, Any]:
                     f"MCP YAML config value for {key!r} must be an integer without a unit"
                 )
             result[key] = int(raw_value)
+            continue
+        if key in _SECONDS_KEYS:
+            if _SECONDS_VALUE.fullmatch(raw_value) is None:
+                raise ValueError(
+                    f"MCP YAML config value for {key!r} must be a number of seconds"
+                )
+            result[key] = float(raw_value)
             continue
         match = _SIZE_VALUE.fullmatch(raw_value)
         if match is None:

@@ -44,6 +44,7 @@ _MANAGED_OR_INCOMPATIBLE_ARGS = {
     "--output-format",
     "--tmux",
     "--tmux-classic",
+    "--model",
     "--permission-mode",
 }
 
@@ -74,14 +75,26 @@ async def _readline_discarding_overflow(
 def validate_config(config: SessionConfig) -> None:
     if not config.cwd.strip():
         raise ValueError("cwd must not be empty")
+    if config.model_id is not None and not config.model_id.strip():
+        raise ValueError("model_id must not be empty")
     if config.launch_mode == "ssh" and not config.ssh_host:
         raise ValueError("ssh_host is required for SSH launch mode")
     if config.startup_timeout_seconds <= 0:
         raise ValueError("startup_timeout_seconds must be positive")
+    if config.turn_cancel_timeout_seconds <= 0:
+        raise ValueError("turn_cancel_timeout_seconds must be positive")
+    if config.local_process_terminate_timeout_seconds <= 0:
+        raise ValueError("local_process_terminate_timeout_seconds must be positive")
+    if config.remote_ssh_cleanup_timeout_seconds <= 0:
+        raise ValueError("remote_ssh_cleanup_timeout_seconds must be positive")
     if config.max_read <= 0:
         raise ValueError("max_read must be positive")
     if config.max_output <= 0:
         raise ValueError("max_output must be positive")
+    if config.stdout_overflow_retry_tolerance < 0:
+        raise ValueError("stdout_overflow_retry_tolerance must be non-negative")
+    if config.stderr_tail_buffer_size <= 0:
+        raise ValueError("stderr_tail_buffer_size must be positive")
     if config.approval_mode not in {"elicitation", "compatible"}:
         raise ValueError(f"unsupported approval mode: {config.approval_mode!r}")
     if config.permission_mode not in {
@@ -110,6 +123,7 @@ def build_launch_argv(config: SessionConfig) -> tuple[list[str], str | None, dic
     codebuddy_argv = [
         config.codebuddy_command,
         *config.codebuddy_args,
+        *(["--model", config.model_id] if config.model_id is not None else []),
         "--permission-mode",
         config.permission_mode,
         "--acp",
@@ -159,7 +173,7 @@ class AcpClient:
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._permission_queue: asyncio.Queue[PermissionRequest] = asyncio.Queue()
-        self._stderr_tail: deque[str] = deque(maxlen=80)
+        self._stderr_tail: deque[str] = deque(maxlen=config.stderr_tail_buffer_size)
         self._turn_buffers = TurnBuffers(spool_max_size=config.max_output)
         self._turn_task: asyncio.Task[dict[str, Any]] | None = None
         self.pending_permission: PermissionRequest | None = None
@@ -200,6 +214,7 @@ class AcpClient:
             launch_config = SessionConfig(
                 launch_mode=self.config.launch_mode,
                 cwd=self.config.cwd,
+                model_id=self.config.model_id,
                 codebuddy_command=self.config.codebuddy_command,
                 codebuddy_args=list(self.config.codebuddy_args),
                 env=dict(self.config.env),
@@ -210,6 +225,13 @@ class AcpClient:
                 resume_session_id=self.config.resume_session_id,
                 permission_mode=self.config.permission_mode,
                 startup_timeout_seconds=self.config.startup_timeout_seconds,
+                turn_cancel_timeout_seconds=self.config.turn_cancel_timeout_seconds,
+                local_process_terminate_timeout_seconds=(
+                    self.config.local_process_terminate_timeout_seconds
+                ),
+                remote_ssh_cleanup_timeout_seconds=self.config.remote_ssh_cleanup_timeout_seconds,
+                stdout_overflow_retry_tolerance=self.config.stdout_overflow_retry_tolerance,
+                stderr_tail_buffer_size=self.config.stderr_tail_buffer_size,
                 max_read=self.config.max_read,
                 max_output=self.config.max_output,
                 approval_mode=self.config.approval_mode,
@@ -506,7 +528,9 @@ class AcpClient:
                     self.pending_permission = None
             turn_task = self._turn_task
             if turn_task is not None:
-                done, _ = await asyncio.wait({turn_task}, timeout=5)
+                done, _ = await asyncio.wait(
+                    {turn_task}, timeout=self.config.turn_cancel_timeout_seconds
+                )
                 if not done:
                     turn_task.cancel()
                     with suppress(Exception, asyncio.CancelledError):
@@ -564,7 +588,9 @@ class AcpClient:
                 with suppress(ProcessLookupError, PermissionError):
                     process.terminate()
             try:
-                await asyncio.wait_for(process.wait(), timeout=5)
+                await asyncio.wait_for(
+                    process.wait(), timeout=self.config.local_process_terminate_timeout_seconds
+                )
             except TimeoutError:
                 try:
                     if os.name != "nt":
@@ -609,7 +635,9 @@ class AcpClient:
                 start_new_session=os.name != "nt",
             )
             try:
-                await asyncio.wait_for(cleanup_process.wait(), timeout=10)
+                await asyncio.wait_for(
+                    cleanup_process.wait(), timeout=self.config.remote_ssh_cleanup_timeout_seconds
+                )
             except TimeoutError:
                 cleanup_process.kill()
                 await cleanup_process.wait()
@@ -636,7 +664,10 @@ class AcpClient:
                 line, overflowed = await _readline_discarding_overflow(self.process.stdout)
                 if overflowed:
                     self._stdout_limit_failures += 1
-                    if self._stdout_limit_failures == 1:
+                    if (
+                        self._stdout_limit_failures
+                        <= self.config.stdout_overflow_retry_tolerance
+                    ):
                         failure = AcpError(
                             f"ACP stdout line exceeded max_read={self.config.max_read} bytes; "
                             "the current response was discarded and its turn was cancelled. "
@@ -652,8 +683,11 @@ class AcpClient:
                     self._fail_pending(failure)
                     self.pending_permission = None
                     self._drain_permission_queue()
-                    if self._stdout_limit_failures == 1:
-                        logger.error("%s; keeping CodeBuddy available for one retry", failure)
+                    if (
+                        self._stdout_limit_failures
+                        <= self.config.stdout_overflow_retry_tolerance
+                    ):
+                        logger.error("%s; keeping CodeBuddy available for another retry", failure)
                         if self.session_id and self.running:
                             try:
                                 await self.notify("session/cancel", {"sessionId": self.session_id})

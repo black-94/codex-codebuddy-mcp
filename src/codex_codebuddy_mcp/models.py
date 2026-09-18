@@ -4,7 +4,17 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Literal, TextIO
 
-from .config import DEFAULT_APPROVAL_MODE, DEFAULT_MAX_OUTPUT, DEFAULT_MAX_READ
+from .config import (
+    DEFAULT_APPROVAL_MODE,
+    DEFAULT_LOCAL_PROCESS_TERMINATE_TIMEOUT_SECONDS,
+    DEFAULT_MAX_OUTPUT,
+    DEFAULT_MAX_READ,
+    DEFAULT_REMOTE_SSH_CLEANUP_TIMEOUT_SECONDS,
+    DEFAULT_STARTUP_TIMEOUT_SECONDS,
+    DEFAULT_STDERR_TAIL_BUFFER_SIZE,
+    DEFAULT_STDOUT_OVERFLOW_RETRY_TOLERANCE,
+    DEFAULT_TURN_CANCEL_TIMEOUT_SECONDS,
+)
 
 LaunchMode = Literal["local", "ssh"]
 PermissionMode = Literal[
@@ -22,6 +32,7 @@ ApprovalMode = Literal["elicitation", "compatible"]
 class SessionConfig:
     launch_mode: LaunchMode
     cwd: str
+    model_id: str | None = None
     codebuddy_command: str = "codebuddy"
     codebuddy_args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
@@ -31,7 +42,14 @@ class SessionConfig:
     auth_method_id: str | None = None
     resume_session_id: str | None = None
     permission_mode: PermissionMode = "auto"
-    startup_timeout_seconds: float = 60.0
+    startup_timeout_seconds: float = DEFAULT_STARTUP_TIMEOUT_SECONDS
+    turn_cancel_timeout_seconds: float = DEFAULT_TURN_CANCEL_TIMEOUT_SECONDS
+    local_process_terminate_timeout_seconds: float = (
+        DEFAULT_LOCAL_PROCESS_TERMINATE_TIMEOUT_SECONDS
+    )
+    remote_ssh_cleanup_timeout_seconds: float = DEFAULT_REMOTE_SSH_CLEANUP_TIMEOUT_SECONDS
+    stdout_overflow_retry_tolerance: int = DEFAULT_STDOUT_OVERFLOW_RETRY_TOLERANCE
+    stderr_tail_buffer_size: int = DEFAULT_STDERR_TAIL_BUFFER_SIZE
     max_read: int = DEFAULT_MAX_READ
     max_output: int = DEFAULT_MAX_OUTPUT
     approval_mode: ApprovalMode = DEFAULT_APPROVAL_MODE

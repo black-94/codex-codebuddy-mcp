@@ -58,6 +58,13 @@ def test_rejects_overriding_managed_permission_mode(tmp_path: Path) -> None:
         validate_config(config)
 
 
+def test_rejects_overriding_required_model_id_with_codebuddy_args(tmp_path: Path) -> None:
+    config = fake_config(tmp_path)
+    config.codebuddy_args.extend(["--model", "other-model"])
+    with pytest.raises(ValueError, match="incompatible"):
+        validate_config(config)
+
+
 def test_rejects_nonpositive_max_read(tmp_path: Path) -> None:
     config = fake_config(tmp_path)
     config.max_read = 0
@@ -65,12 +72,46 @@ def test_rejects_nonpositive_max_read(tmp_path: Path) -> None:
         validate_config(config)
 
 
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("turn_cancel_timeout_seconds", "turn_cancel_timeout_seconds must be positive"),
+        (
+            "local_process_terminate_timeout_seconds",
+            "local_process_terminate_timeout_seconds must be positive",
+        ),
+        (
+            "remote_ssh_cleanup_timeout_seconds",
+            "remote_ssh_cleanup_timeout_seconds must be positive",
+        ),
+        ("stderr_tail_buffer_size", "stderr_tail_buffer_size must be positive"),
+    ],
+)
+def test_rejects_invalid_process_lifecycle_settings(
+    tmp_path: Path, field: str, message: str
+) -> None:
+    config = fake_config(tmp_path)
+    setattr(config, field, 0)
+
+    with pytest.raises(ValueError, match=message):
+        validate_config(config)
+
+
+def test_stderr_tail_buffer_size_is_applied(tmp_path: Path) -> None:
+    config = fake_config(tmp_path)
+    config.stderr_tail_buffer_size = 3
+
+    client = AcpClient(config)
+
+    assert client._stderr_tail.maxlen == 3
+
+
 def test_builds_safely_quoted_ssh_command() -> None:
     config = SessionConfig(
         launch_mode="ssh",
         cwd="/tmp/project with spaces",
+        model_id="fast-model",
         codebuddy_command="/opt/code buddy/bin/codebuddy",
-        codebuddy_args=["--model", "fast-model"],
         env={"SAFE_VALUE": "value with spaces"},
         ssh_host="dev-box",
         ssh_args=["-T"],
@@ -81,6 +122,7 @@ def test_builds_safely_quoted_ssh_command() -> None:
     assert "cd '/tmp/project with spaces'" in argv[4]
     assert "'SAFE_VALUE=value with spaces'" in argv[4]
     assert "'/opt/code buddy/bin/codebuddy'" in argv[4]
+    assert "--model fast-model" in argv[4]
     assert "--permission-mode auto" in argv[4]
     assert "${TMPDIR:-/tmp}" in argv[4]
     assert "set -m" in argv[4]
@@ -305,6 +347,26 @@ async def test_first_oversized_stdout_allows_retry_and_second_terminates(tmp_pat
         await client.cancel_turn()
         assert client.running
 
+        await client.begin_prompt("large-output")
+        with pytest.raises(AcpError, match="repeatedly exceeded"):
+            await client.wait_for_turn_event(5)
+        for _ in range(50):
+            if not client.running:
+                break
+            await asyncio.sleep(0.01)
+        assert not client.running
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_zero_stdout_overflow_tolerance_terminates_on_first_overflow(tmp_path: Path) -> None:
+    config = fake_config(tmp_path)
+    config.max_read = 1024
+    config.stdout_overflow_retry_tolerance = 0
+    client = AcpClient(config)
+    await client.start()
+    try:
         await client.begin_prompt("large-output")
         with pytest.raises(AcpError, match="repeatedly exceeded"):
             await client.wait_for_turn_event(5)

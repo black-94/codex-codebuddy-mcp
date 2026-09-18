@@ -36,12 +36,24 @@ max_read: 1048576 # 1 MiB, one ACP stdout/stderr line
 max_output: 65536 # 64 KiB, one MCP result
 max_concurrency: 2 # simultaneous active prompt turns
 approval_mode: elicitation
+timeout_seconds: 900 # default prompt/permission-turn timeout
+startup_timeout_seconds: 60 # ACP initialize/session startup timeout
+turn_cancel_timeout_seconds: 5 # wait for ACP turn cancellation
+local_process_terminate_timeout_seconds: 5 # wait before local SIGKILL
+remote_ssh_cleanup_timeout_seconds: 10 # wait for remote cleanup SSH command
+stdout_overflow_retry_tolerance: 1 # oversized stdout turns tolerated before termination
+stderr_tail_buffer_size: 80 # stderr lines retained for diagnostics
 ```
 
 Installed wheels use the built-in defaults unless `CODEX_CODEBUDDY_MCP_CONFIG` names a YAML file.
 The `KB`, `MB`, and `GB` suffixes are accepted as binary multiples for backward compatibility;
 `max_concurrency` must be a unitless integer. The values can be overridden for an individual
-session by passing `max_read` and/or `max_output` to `create_codebuddy_session`.
+session by passing `max_read` and/or `max_output` to `create_codebuddy_session`. Timeout values
+are seconds. `stdout_overflow_retry_tolerance` is the number of oversized stdout responses that
+may be discarded while keeping the process available; `0` terminates the process on the first
+overflow. `stderr_tail_buffer_size` is measured in stderr lines. The prompt tools'
+`timeout_seconds` and the session creation tool's `startup_timeout_seconds` also accept per-call
+overrides.
 `max_concurrency` applies globally to all bridge sessions and is loaded when the MCP server starts.
 
 Example Codex MCP configuration:
@@ -70,18 +82,19 @@ maintain a model allowlist. If CodeBuddy does not report model metadata, those t
 `null`, rather than echoing an unverified model argument. If startup or session recovery fails,
 this call returns an error and does not leave a usable bridge session behind.
 
-`cwd` is required and sets the working directory for the CodeBuddy session. If it is present but
-empty or contains only whitespace, the bridge asks the user to enter a working directory through
-MCP elicitation. Clients without elicitation support receive an error that asks the caller to retry
-with a non-empty `cwd`.
+`cwd` and `model_id` are required. `cwd` sets the working directory for the CodeBuddy session. If it
+is present but empty or contains only whitespace, the bridge asks the user to enter a working
+directory through MCP elicitation. Clients without elicitation support receive an error that asks
+the caller to retry with a non-empty `cwd`. `model_id` must be non-empty and is passed to CodeBuddy
+as `--model`; do not repeat `--model` in `codebuddy_args`.
 
 Local example arguments:
 
 ```json
 {
   "cwd": "/path/to/project",
+  "model_id": "deepseek-v4.1-flash",
   "launch_mode": "local",
-  "codebuddy_args": ["--model", "deepseek-v4.1-flash"],
   "permission_mode": "auto",
   "approval_mode": "elicitation",
   "max_read": 4194304,
@@ -94,11 +107,11 @@ SSH example arguments:
 ```json
 {
   "cwd": "/home/dev/project",
+  "model_id": "deepseek-v4.1-flash",
   "launch_mode": "ssh",
   "ssh_host": "dev-box",
   "ssh_args": ["-T"],
-  "codebuddy_command": "/usr/local/bin/codebuddy",
-  "codebuddy_args": ["--model", "deepseek-v4.1-flash"]
+  "codebuddy_command": "/usr/local/bin/codebuddy"
 }
 ```
 
@@ -124,7 +137,8 @@ reading each ACP stdout/stderr line. Its YAML default is `1048576` bytes (1 MiB)
 a single ACP JSON line can be larger; it must be a positive integer. On the first stdout overrun,
 the bridge discards that response, cancels the current turn, and keeps the process available so the
 caller can request a compressed answer. Changing `max_read` requires creating a new bridge session.
-A successful turn clears the overrun count; a second consecutive overrun terminates the process.
+A successful turn clears the overrun count; once `stdout_overflow_retry_tolerance` is exceeded,
+the process is terminated.
 Oversized stderr lines are discarded without stopping the session. `max_output` controls the MCP
 result threshold and defaults to `65536` bytes (64 KiB).
 

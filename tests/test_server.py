@@ -77,11 +77,20 @@ async def test_elicitation_mode_does_not_downgrade_without_client_capability() -
 
 
 @pytest.mark.asyncio
-async def test_create_session_schema_requires_working_directory() -> None:
+async def test_create_session_schema_requires_working_directory_and_model() -> None:
     tools = await mcp.list_tools()
     create_tool = next(tool for tool in tools if tool.name == "create_codebuddy_session")
 
     assert "cwd" in create_tool.inputSchema["required"]
+    assert "model_id" in create_tool.inputSchema["required"]
+
+
+@pytest.mark.asyncio
+async def test_create_session_rejects_empty_model_id(tmp_path) -> None:
+    ctx = SimpleNamespace(client_id="empty-model-owner", session=SimpleNamespace())
+
+    with pytest.raises(ValueError, match="model_id must not be empty"):
+        await create_codebuddy_session(cwd=str(tmp_path), model_id="   ", ctx=ctx)
 
 
 @pytest.mark.asyncio
@@ -134,6 +143,7 @@ async def test_remote_session_starts_during_creation(monkeypatch, tmp_path) -> N
 
     result = await create_codebuddy_session(
         cwd=str(tmp_path),
+        model_id="test-model",
         ctx=ctx,
         launch_mode="ssh",
         ssh_host="test-host",
@@ -155,12 +165,14 @@ async def test_real_create_session_uses_default_auto_permission_mode(tmp_path) -
     ctx = SimpleNamespace(client_id="real-auto-owner", session=SimpleNamespace())
     created = await create_codebuddy_session(
         cwd=str(tmp_path),
+        model_id="deepseek-v4.1-flash",
         ctx=ctx,
         codebuddy_command=executable,
         startup_timeout_seconds=120,
     )
     bridge_session_id = created["bridge_session_id"]
     try:
+        assert created["model_id"] == "deepseek-v4.1-flash"
         assert created["permission_mode"] == "auto"
         session = registry.get(bridge_session_id, ctx.client_id)
         argv, _, _ = build_launch_argv(session.config)
@@ -212,6 +224,7 @@ async def test_real_codebuddy_permission_request_is_forwarded(tmp_path, approval
     )
     created = await create_codebuddy_session(
         cwd=str(tmp_path),
+        model_id="deepseek-v4.1-flash",
         ctx=ctx,
         codebuddy_command=executable,
         codebuddy_args=["--tools", "Bash"],

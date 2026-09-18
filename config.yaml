@@ -3,3 +3,15 @@ max_read: 1048576
 max_output: 65536
 max_concurrency: 2
 approval_mode: elicitation
+
+# Timeouts are seconds. They apply when the corresponding tool argument is omitted.
+timeout_seconds: 1800
+startup_timeout_seconds: 60
+turn_cancel_timeout_seconds: 5
+local_process_terminate_timeout_seconds: 5
+remote_ssh_cleanup_timeout_seconds: 10
+
+# A stdout overflow is tolerated this many times before the process is terminated.
+stdout_overflow_retry_tolerance: 1
+# Number of stderr lines retained for diagnostics.
+stderr_tail_buffer_size: 200

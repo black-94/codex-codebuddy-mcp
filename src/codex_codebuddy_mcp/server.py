@@ -12,7 +12,7 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from .acp import AcpError
 from .bridge import BridgeSession, SessionRegistry, permission_result
-from .config import DEFAULT_TURN_TIMEOUT_SECONDS, load_defaults
+from .config import load_defaults
 from .models import ApprovalMode, PermissionMode, PermissionRequest, SessionConfig
 
 logger = logging.getLogger(__name__)
@@ -231,6 +231,7 @@ async def _externalize_result(
 @mcp.tool()
 async def create_codebuddy_session(
     cwd: str,
+    model_id: str,
     ctx: Context,
     launch_mode: Literal["local", "ssh"] = "local",
     codebuddy_command: str = "codebuddy",
@@ -243,7 +244,7 @@ async def create_codebuddy_session(
     resume_session_id: str | None = None,
     permission_mode: PermissionMode = "auto",
     approval_mode: ApprovalMode | None = None,
-    startup_timeout_seconds: float = 60.0,
+    startup_timeout_seconds: float = DEFAULTS.startup_timeout_seconds,
     max_read: int | None = None,
     max_output: int | None = None,
 ) -> dict[str, Any]:
@@ -253,12 +254,16 @@ async def create_codebuddy_session(
     configuration. The process is started and the ACP session is established
     before this call returns.
     ``approval_mode``, ``max_read`` and ``max_output`` override the YAML
-    defaults for this session.
+    defaults for this session. The timeout and process-buffer settings are
+    loaded from the YAML defaults when the MCP server starts.
     """
     cwd = await _resolve_working_directory(ctx, cwd)
+    if not isinstance(model_id, str) or not model_id.strip():
+        raise ValueError("model_id must not be empty")
     config = SessionConfig(
         launch_mode=launch_mode,
         cwd=cwd,
+        model_id=model_id.strip(),
         codebuddy_command=codebuddy_command,
         codebuddy_args=list(codebuddy_args or []),
         env=dict(env or {}),
@@ -270,6 +275,11 @@ async def create_codebuddy_session(
         permission_mode=permission_mode,
         approval_mode=DEFAULTS.approval_mode if approval_mode is None else approval_mode,
         startup_timeout_seconds=startup_timeout_seconds,
+        turn_cancel_timeout_seconds=DEFAULTS.turn_cancel_timeout_seconds,
+        local_process_terminate_timeout_seconds=DEFAULTS.local_process_terminate_timeout_seconds,
+        remote_ssh_cleanup_timeout_seconds=DEFAULTS.remote_ssh_cleanup_timeout_seconds,
+        stdout_overflow_retry_tolerance=DEFAULTS.stdout_overflow_retry_tolerance,
+        stderr_tail_buffer_size=DEFAULTS.stderr_tail_buffer_size,
         max_read=DEFAULTS.max_read if max_read is None else max_read,
         max_output=DEFAULTS.max_output if max_output is None else max_output,
     )
@@ -291,6 +301,12 @@ async def create_codebuddy_session(
         "model_name": session.client.model_name,
         "permission_mode": config.permission_mode,
         "approval_mode": config.approval_mode,
+        "startup_timeout_seconds": config.startup_timeout_seconds,
+        "turn_cancel_timeout_seconds": config.turn_cancel_timeout_seconds,
+        "local_process_terminate_timeout_seconds": config.local_process_terminate_timeout_seconds,
+        "remote_ssh_cleanup_timeout_seconds": config.remote_ssh_cleanup_timeout_seconds,
+        "stdout_overflow_retry_tolerance": config.stdout_overflow_retry_tolerance,
+        "stderr_tail_buffer_size": config.stderr_tail_buffer_size,
         "max_read": config.max_read,
         "max_output": config.max_output,
     }
@@ -334,7 +350,7 @@ async def prompt_codebuddy(
     bridge_session_id: str,
     prompt: str,
     ctx: Context,
-    timeout_seconds: float = DEFAULT_TURN_TIMEOUT_SECONDS,
+    timeout_seconds: float = DEFAULTS.timeout_seconds,
     max_output: int | None = None,
 ) -> dict[str, Any]:
     """Send a text prompt to the bound CodeBuddy session.
@@ -389,7 +405,7 @@ async def respond_codebuddy_permission(
     request_id: str,
     option_id: str,
     ctx: Context,
-    timeout_seconds: float = DEFAULT_TURN_TIMEOUT_SECONDS,
+    timeout_seconds: float = DEFAULTS.timeout_seconds,
     max_output: int | None = None,
 ) -> dict[str, Any]:
     """Resolve a pending CodeBuddy permission request and continue the turn."""

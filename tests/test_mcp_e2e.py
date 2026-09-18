@@ -44,6 +44,7 @@ async def test_mcp_stdio_tool_flow(tmp_path: Path) -> None:
                     "create_codebuddy_session",
                     {
                         "cwd": str(tmp_path),
+                        "model_id": "fake-model-id",
                         "codebuddy_command": sys.executable,
                         "codebuddy_args": [str(FAKE_CODEBUDDY)],
                         "approval_mode": "compatible",
@@ -149,6 +150,7 @@ async def test_mcp_stdio_tool_flow(tmp_path: Path) -> None:
                     "create_codebuddy_session",
                     {
                         "cwd": str(tmp_path),
+                        "model_id": "fake-model-id",
                         "codebuddy_command": sys.executable,
                         "codebuddy_args": [str(FAKE_CODEBUDDY)],
                         "approval_mode": "compatible",
