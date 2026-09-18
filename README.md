@@ -70,6 +70,11 @@ maintain a model allowlist. If CodeBuddy does not report model metadata, those t
 `null`, rather than echoing an unverified model argument. If startup or session recovery fails,
 this call returns an error and does not leave a usable bridge session behind.
 
+`cwd` is required and sets the working directory for the CodeBuddy session. If it is present but
+empty or contains only whitespace, the bridge asks the user to enter a working directory through
+MCP elicitation. Clients without elicitation support receive an error that asks the caller to retry
+with a non-empty `cwd`.
+
 Local example arguments:
 
 ```json
@@ -198,9 +203,10 @@ with the same file externalization behavior.
 Completing a prompt does not close CodeBuddy. Cancellation keeps the CodeBuddy process available.
 Closing cancels active work, terminates the local process or SSH channel, and removes the bridge
 session. On SSH, the bridge records a unique remote PID file and performs a second SSH cleanup command
-that terminates that process group. This handles CodeBuddy processes that outlive the SSH channel;
-abrupt network loss or a remote process that ignores termination cannot be guaranteed by the local
-client.
+that terminates that process group. The remote shell uses `set -m`, starts CodeBuddy as a monitored
+job, and waits for it so the SSH stdio channel stays connected for ACP responses. This handles
+CodeBuddy processes that outlive the SSH channel; abrupt network loss or a remote process that
+ignores termination cannot be guaranteed by the local client.
 
 ## Tests
 

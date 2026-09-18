@@ -43,6 +43,47 @@ def _supports_elicitation(ctx: Context) -> bool:
     return bool(params and getattr(params.capabilities, "elicitation", None) is not None)
 
 
+async def _resolve_working_directory(ctx: Context, cwd: str) -> str:
+    working_directory = cwd.strip()
+    if working_directory:
+        return working_directory
+
+    if not _supports_elicitation(ctx):
+        raise AcpError(
+            "Working directory is required; the MCP client does not support elicitation, "
+            "so call create_codebuddy_session again with a non-empty cwd"
+        )
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "cwd": {
+                "type": "string",
+                "title": "Working directory",
+                "description": "Local or remote working directory for the CodeBuddy session",
+                "minLength": 1,
+            }
+        },
+        "required": ["cwd"],
+    }
+    message = "A working directory is required to create the CodeBuddy session. Please enter it."
+    try:
+        result = await ctx.session.elicit_form(message, schema, ctx.request_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        raise AcpError(f"Working directory elicitation failed: {exc}") from exc
+
+    if result.action == "accept" and result.content:
+        value = result.content.get("cwd")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        raise AcpError("Working directory must not be empty")
+    if result.action in {"decline", "cancel"}:
+        raise AcpError("Working directory is required but was not provided")
+    raise AcpError(f"Working directory elicitation returned unsupported action: {result.action!r}")
+
+
 async def _elicit_permission(ctx: Context, permission: PermissionRequest) -> str | None:
     if not _supports_elicitation(ctx):
         raise AcpError(
@@ -214,6 +255,7 @@ async def create_codebuddy_session(
     ``approval_mode``, ``max_read`` and ``max_output`` override the YAML
     defaults for this session.
     """
+    cwd = await _resolve_working_directory(ctx, cwd)
     config = SessionConfig(
         launch_mode=launch_mode,
         cwd=cwd,

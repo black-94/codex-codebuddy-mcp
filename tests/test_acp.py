@@ -37,6 +37,14 @@ def test_rejects_arguments_that_break_acp_stdio(tmp_path: Path) -> None:
         validate_config(config)
 
 
+def test_rejects_whitespace_only_working_directory(tmp_path: Path) -> None:
+    config = fake_config(tmp_path)
+    config.cwd = "   "
+
+    with pytest.raises(ValueError, match="cwd must not be empty"):
+        validate_config(config)
+
+
 def test_uses_auto_permission_mode_by_default(tmp_path: Path) -> None:
     argv, _, _ = build_launch_argv(fake_config(tmp_path))
     mode_index = argv.index("--permission-mode")
@@ -75,10 +83,51 @@ def test_builds_safely_quoted_ssh_command() -> None:
     assert "'/opt/code buddy/bin/codebuddy'" in argv[4]
     assert "--permission-mode auto" in argv[4]
     assert "${TMPDIR:-/tmp}" in argv[4]
-    assert "exec setsid sh -c" in argv[4]
+    assert "set -m" in argv[4]
+    assert "codebuddy_pid=$!" in argv[4]
+    assert 'wait "$codebuddy_pid"' in argv[4]
+    assert "setsid" not in argv[4]
     assert "codex-codebuddy-test.pid" in argv[4]
     assert "--acp --acp-transport stdio" in argv[4]
     assert cwd is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="remote launch requires a POSIX shell")
+@pytest.mark.asyncio
+async def test_remote_monitor_shell_keeps_stdio_open_until_child_exits(tmp_path: Path) -> None:
+    shell = shutil.which("sh")
+    if shell is None:
+        pytest.skip("sh is not installed")
+
+    config = SessionConfig(
+        launch_mode="ssh",
+        cwd=str(tmp_path),
+        codebuddy_command=sys.executable,
+        codebuddy_args=[
+            "-c",
+            "import sys; line = sys.stdin.readline(); print('reply:' + line, end='', flush=True)",
+        ],
+        ssh_host="unused",
+        remote_pid_file="set-m-test.pid",
+    )
+    argv, _, _ = build_launch_argv(config)
+    env = os.environ.copy()
+    env["TMPDIR"] = str(tmp_path)
+    process = await asyncio.create_subprocess_exec(
+        shell,
+        "-c",
+        argv[-1],
+        env=env,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    stdout, _ = await asyncio.wait_for(process.communicate(b"ping\n"), timeout=5)
+
+    assert process.returncode == 0
+    assert stdout == b"reply:ping\n"
+    assert (tmp_path / "set-m-test.pid").read_text(encoding="utf-8").strip().isdigit()
 
 
 @pytest.mark.asyncio

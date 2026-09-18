@@ -72,7 +72,7 @@ async def _readline_discarding_overflow(
 
 
 def validate_config(config: SessionConfig) -> None:
-    if not config.cwd:
+    if not config.cwd.strip():
         raise ValueError("cwd must not be empty")
     if config.launch_mode == "ssh" and not config.ssh_host:
         raise ValueError("ssh_host is required for SSH launch mode")
@@ -131,13 +131,11 @@ def build_launch_argv(config: SessionConfig) -> tuple[list[str], str | None, dic
     if config.remote_pid_file:
         pid_name = shlex.quote(config.remote_pid_file)
         remote_prefix += f' && remote_tmp="${{TMPDIR:-/tmp}}" && pid_file="$remote_tmp"/{pid_name}'
-        leader_script = 'echo "$$" > "$1"; shift; exec "$@"'
         remote_command = (
-            f"{remote_prefix} && "
-            "if command -v setsid >/dev/null 2>&1; then "
-            f"exec setsid sh -c {shlex.quote(leader_script)} codebuddy-session "
-            f'"$pid_file" {remote_program}; '
-            f'else echo "$$" > "$pid_file" && exec {remote_program}; fi'
+            f"{remote_prefix} && set -m && {{ "
+            f"{remote_program} & codebuddy_pid=$!; "
+            'echo "$codebuddy_pid" > "$pid_file"; '
+            'wait "$codebuddy_pid"; }'
         )
     else:
         remote_command = f"{remote_prefix} && exec {remote_program}"

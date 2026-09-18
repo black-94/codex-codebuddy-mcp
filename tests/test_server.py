@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -12,7 +13,9 @@ from codex_codebuddy_mcp.models import PermissionRequest
 from codex_codebuddy_mcp.server import (
     _elicit_permission,
     _externalize_result,
+    _resolve_working_directory,
     create_codebuddy_session,
+    mcp,
     registry,
 )
 
@@ -67,6 +70,50 @@ async def test_elicitation_mode_does_not_downgrade_without_client_capability() -
 
     with pytest.raises(AcpError, match="does not support elicitation"):
         await _elicit_permission(ctx, permission)
+
+
+@pytest.mark.asyncio
+async def test_create_session_schema_requires_working_directory() -> None:
+    tools = await mcp.list_tools()
+    create_tool = next(tool for tool in tools if tool.name == "create_codebuddy_session")
+
+    assert "cwd" in create_tool.inputSchema["required"]
+
+
+@pytest.mark.asyncio
+async def test_empty_working_directory_is_elicited() -> None:
+    session = SimpleNamespace(
+        client_params=SimpleNamespace(
+            capabilities=SimpleNamespace(elicitation=object()),
+        ),
+        elicit_form=AsyncMock(
+            return_value=SimpleNamespace(
+                action="accept",
+                content={"cwd": "  /tmp/user-project  "},
+            )
+        ),
+    )
+    ctx = SimpleNamespace(request_id="mcp-request-1", session=session)
+
+    resolved = await _resolve_working_directory(ctx, "   ")
+
+    assert resolved == "/tmp/user-project"
+    session.elicit_form.assert_awaited_once()
+    message, schema, request_id = session.elicit_form.await_args.args
+    assert "working directory" in message.lower()
+    assert schema["required"] == ["cwd"]
+    assert request_id == "mcp-request-1"
+
+
+@pytest.mark.asyncio
+async def test_empty_working_directory_without_elicitation_is_actionable() -> None:
+    ctx = SimpleNamespace(
+        request_id="mcp-request-1",
+        session=SimpleNamespace(client_params=None),
+    )
+
+    with pytest.raises(AcpError, match="call create_codebuddy_session again"):
+        await _resolve_working_directory(ctx, "")
 
 
 @pytest.mark.asyncio
