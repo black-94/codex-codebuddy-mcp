@@ -233,3 +233,5 @@ __marimo__/
 # Local MCP development state
 .mcp/
 .codex/
+
+.idea/
