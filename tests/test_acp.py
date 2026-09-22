@@ -2,503 +2,261 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-from codex_codebuddy_mcp.acp import (
-    AcpClient,
-    AcpError,
-    _readline_discarding_overflow,
-    build_launch_argv,
-    validate_config,
-)
-from codex_codebuddy_mcp.models import PermissionRequest, SessionConfig
+from harness_acp_mcp.acp import AcpClient, AcpError
+from harness_acp_mcp.adapters import _normalize_auth_status, get_adapter
+from harness_acp_mcp.models import SessionConfig
+from harness_acp_mcp.supervisor import _cleanup_remote, _remote_command
 
-FAKE_CODEBUDDY = Path(__file__).with_name("fake_codebuddy.py")
+FAKE_HARNESS = Path(__file__).with_name("fake_harness.py")
 
 
-def fake_config(cwd: Path) -> SessionConfig:
+def fake_config(tmp_path: Path, harness: str = "codex") -> SessionConfig:
     return SessionConfig(
+        harness=harness,
         launch_mode="local",
-        cwd=str(cwd),
-        codebuddy_command=sys.executable,
-        codebuddy_args=[str(FAKE_CODEBUDDY)],
-        startup_timeout_seconds=5,
-    )
-
-
-def test_rejects_arguments_that_break_acp_stdio(tmp_path: Path) -> None:
-    config = fake_config(tmp_path)
-    config.codebuddy_args.append("--serve")
-    with pytest.raises(ValueError, match="incompatible"):
-        validate_config(config)
-
-
-def test_rejects_whitespace_only_working_directory(tmp_path: Path) -> None:
-    config = fake_config(tmp_path)
-    config.cwd = "   "
-
-    with pytest.raises(ValueError, match="cwd must not be empty"):
-        validate_config(config)
-
-
-def test_uses_auto_permission_mode_by_default(tmp_path: Path) -> None:
-    argv, _, _ = build_launch_argv(fake_config(tmp_path))
-    mode_index = argv.index("--permission-mode")
-    assert argv[mode_index + 1] == "auto"
-
-
-def test_rejects_overriding_managed_permission_mode(tmp_path: Path) -> None:
-    config = fake_config(tmp_path)
-    config.codebuddy_args.extend(["--permission-mode", "default"])
-    with pytest.raises(ValueError, match="incompatible"):
-        validate_config(config)
-
-
-def test_rejects_overriding_required_model_id_with_codebuddy_args(tmp_path: Path) -> None:
-    config = fake_config(tmp_path)
-    config.codebuddy_args.extend(["--model", "other-model"])
-    with pytest.raises(ValueError, match="incompatible"):
-        validate_config(config)
-
-
-def test_rejects_nonpositive_max_read(tmp_path: Path) -> None:
-    config = fake_config(tmp_path)
-    config.max_read = 0
-    with pytest.raises(ValueError, match="max_read must be positive"):
-        validate_config(config)
-
-
-@pytest.mark.parametrize(
-    ("field", "message"),
-    [
-        ("turn_cancel_timeout_seconds", "turn_cancel_timeout_seconds must be positive"),
-        (
-            "local_process_terminate_timeout_seconds",
-            "local_process_terminate_timeout_seconds must be positive",
-        ),
-        (
-            "remote_ssh_cleanup_timeout_seconds",
-            "remote_ssh_cleanup_timeout_seconds must be positive",
-        ),
-        ("stderr_tail_buffer_size", "stderr_tail_buffer_size must be positive"),
-    ],
-)
-def test_rejects_invalid_process_lifecycle_settings(
-    tmp_path: Path, field: str, message: str
-) -> None:
-    config = fake_config(tmp_path)
-    setattr(config, field, 0)
-
-    with pytest.raises(ValueError, match=message):
-        validate_config(config)
-
-
-def test_stderr_tail_buffer_size_is_applied(tmp_path: Path) -> None:
-    config = fake_config(tmp_path)
-    config.stderr_tail_buffer_size = 3
-
-    client = AcpClient(config)
-
-    assert client._stderr_tail.maxlen == 3
-
-
-def test_builds_safely_quoted_ssh_command() -> None:
-    config = SessionConfig(
-        launch_mode="ssh",
-        cwd="/tmp/project with spaces",
-        model_id="fast-model",
-        codebuddy_command="/opt/code buddy/bin/codebuddy",
-        env={"SAFE_VALUE": "value with spaces"},
-        ssh_host="dev-box",
-        ssh_args=["-T"],
-        remote_pid_file="codex-codebuddy-test.pid",
-    )
-    argv, cwd, _ = build_launch_argv(config)
-    assert argv[:4] == ["ssh", "-T", "--", "dev-box"]
-    assert "cd '/tmp/project with spaces'" in argv[4]
-    assert "'SAFE_VALUE=value with spaces'" in argv[4]
-    assert "'/opt/code buddy/bin/codebuddy'" in argv[4]
-    assert "--model fast-model" in argv[4]
-    assert "--permission-mode auto" in argv[4]
-    assert "${TMPDIR:-/tmp}" in argv[4]
-    assert "set -m" in argv[4]
-    assert "codebuddy_pid=$!" in argv[4]
-    assert 'wait "$codebuddy_pid"' in argv[4]
-    assert "setsid" not in argv[4]
-    assert "codex-codebuddy-test.pid" in argv[4]
-    assert "--acp --acp-transport stdio" in argv[4]
-    assert cwd is None
-
-
-@pytest.mark.skipif(os.name == "nt", reason="remote launch requires a POSIX shell")
-@pytest.mark.asyncio
-async def test_remote_monitor_shell_keeps_stdio_open_until_child_exits(tmp_path: Path) -> None:
-    shell = shutil.which("sh")
-    if shell is None:
-        pytest.skip("sh is not installed")
-
-    config = SessionConfig(
-        launch_mode="ssh",
         cwd=str(tmp_path),
-        codebuddy_command=sys.executable,
-        codebuddy_args=[
-            "-c",
-            "import sys; line = sys.stdin.readline(); print('reply:' + line, end='', flush=True)",
-        ],
-        ssh_host="unused",
-        remote_pid_file="set-m-test.pid",
+        model_id="fake-model",
+        command=sys.executable,
+        args=[str(FAKE_HARNESS)],
+        startup_timeout_seconds=5,
+        terminate_grace_seconds=0.1,
+        remote_cleanup_timeout_seconds=0.1,
     )
-    argv, _, _ = build_launch_argv(config)
-    env = os.environ.copy()
-    env["TMPDIR"] = str(tmp_path)
-    process = await asyncio.create_subprocess_exec(
-        shell,
-        "-c",
-        argv[-1],
-        env=env,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    stdout, _ = await asyncio.wait_for(process.communicate(b"ping\n"), timeout=5)
-
-    assert process.returncode == 0
-    assert stdout == b"reply:ping\n"
-    assert (tmp_path / "set-m-test.pid").read_text(encoding="utf-8").strip().isdigit()
 
 
 @pytest.mark.asyncio
-async def test_overflow_reader_drains_through_newline() -> None:
-    reader = asyncio.StreamReader(limit=8)
-    reader.feed_data(b"x" * 20 + b"\nnext\n")
-    reader.feed_eof()
-
-    discarded, overflowed = await _readline_discarding_overflow(reader)
-    next_line, next_overflowed = await _readline_discarding_overflow(reader)
-
-    assert discarded == b""
-    assert overflowed is True
-    assert next_line == b"next\n"
-    assert next_overflowed is False
-
-
-@pytest.mark.asyncio
-async def test_start_and_prompt(tmp_path: Path) -> None:
+async def test_generic_transport_auth_session_model_and_prompt(tmp_path: Path) -> None:
     client = AcpClient(fake_config(tmp_path))
-    assert client.process is None
-
-    await client.start()
+    await client.start_transport()
     try:
-        assert client.running
-        assert client.session_id and client.session_id.startswith("fake-session-")
-        assert client.model_id == "fake-model-id"
-        assert client.model_name == "Fake Model"
-        await client.set_model("fake-fast-id")
-        assert client.model_id == "fake-fast-id"
-        assert client.model_name == "Fake Fast Model"
-        with pytest.raises(AcpError, match="Unknown model"):
-            await client.set_model("unknown-model")
-        assert client.model_id == "fake-fast-id"
+        info = await client.get_auth_info()
+        assert info.authenticated is True
+        assert info.user == {"email": "user@example.invalid"}
+        await client.open_session()
+        assert client.session_id == "fake-session"
+        assert client.model_id == "fake-model"
+        await client.set_model("fake-fast")
+        assert client.model_id == "fake-fast"
+
         await client.begin_prompt("hello")
         event = await client.wait_for_turn_event(5)
         assert event["kind"] == "complete"
         assert event["result"]["text"] == "echo:hello"
-        assert event["result"]["stop_reason"] == "end_turn"
-    finally:
-        await client.close()
-    assert not client.running
-
-
-@pytest.mark.asyncio
-async def test_resume_uses_requested_id_when_load_omits_it(tmp_path: Path) -> None:
-    first = AcpClient(fake_config(tmp_path))
-    await first.start()
-    session_id = first.session_id
-    await first.close()
-
-    resumed_config = fake_config(tmp_path)
-    resumed_config.resume_session_id = session_id
-    resumed_config.env["FAKE_LOAD_OMIT_SESSION_ID"] = "1"
-    resumed = AcpClient(resumed_config)
-    await resumed.start()
-    try:
-        assert resumed.session_id == session_id
-    finally:
-        await resumed.close()
-
-
-@pytest.mark.asyncio
-async def test_authenticates_when_agent_advertises_methods(tmp_path: Path) -> None:
-    client = AcpClient(fake_config(tmp_path))
-    client.config.auth_method_id = "external"
-    client.config.env["FAKE_AUTHENTICATED"] = "0"
-    await client.start()
-    try:
-        assert client.session_id
     finally:
         await client.close()
 
 
 @pytest.mark.asyncio
-async def test_authentication_tolerates_missing_private_user_info_method(tmp_path: Path) -> None:
+async def test_permission_and_information_interactions_are_independent(tmp_path: Path) -> None:
     client = AcpClient(fake_config(tmp_path))
-    client.config.auth_method_id = "external"
-    client.config.env["FAKE_USER_INFO_UNSUPPORTED"] = "1"
-    await client.start()
+    await client.start_transport()
+    await client.open_session()
     try:
-        assert client.session_id
-    finally:
-        await client.close()
-
-
-@pytest.mark.asyncio
-async def test_permission_round_trip(tmp_path: Path) -> None:
-    client = AcpClient(fake_config(tmp_path))
-    await client.start()
-    try:
-        await client.begin_prompt("needs permission")
+        await client.begin_prompt("permission")
         event = await client.wait_for_turn_event(5)
-        assert event["kind"] == "permission"
-        permission = event["permission"]
-        assert permission.request_id == "permission-1"
-        assert permission.tool_name == "Bash"
-        assert permission.raw_input == {"command": "touch sample.txt"}
-
-        with pytest.raises(AcpError, match="turn is active"):
-            await client.set_model("fake-fast-id")
-
-        with pytest.raises(AcpError, match="unknown permission"):
-            await client.resolve_permission("permission-1", "not-an-option")
-
-        await client.resolve_permission("permission-1", "allow")
+        permission = event["interaction"]
+        assert permission.kind == "permission"
+        await client.respond_interaction(permission.request_id, {"option_id": "allow"})
         completed = await client.wait_for_turn_event(5)
-        assert completed["kind"] == "complete"
-        assert completed["result"]["text"].endswith(";permission:allow")
-    finally:
-        await client.close()
+        assert completed["result"]["text"].endswith(";answer:allow")
 
-
-@pytest.mark.asyncio
-async def test_cancel_clears_permission_without_reject_option(tmp_path: Path) -> None:
-    client = AcpClient(fake_config(tmp_path))
-    client.pending_permission = PermissionRequest(
-        rpc_id=1,
-        request_id="permission-1",
-        session_id="session-1",
-        tool_name="Bash",
-        raw_input={},
-        options=[{"kind": "allow", "optionId": "allow"}],
-        meta={},
-    )
-
-    await client.cancel_turn()
-
-    assert client.pending_permission is None
-
-
-@pytest.mark.asyncio
-async def test_waiter_returns_cancelled_during_concurrent_cancel(tmp_path: Path) -> None:
-    client = AcpClient(fake_config(tmp_path))
-    await client.start()
-    try:
-        await client.begin_prompt("needs permission")
-        permission = await client.wait_for_turn_event(5)
-        assert permission["kind"] == "permission"
-
-        waiter = asyncio.create_task(client.wait_for_turn_event(5))
-        await asyncio.sleep(0)
-        await client.cancel_turn()
-        result = await waiter
-
-        assert result["kind"] == "complete"
-        assert result["result"]["status"] == "cancelled"
-        assert client.pending_permission is None
-    finally:
-        await client.close()
-
-
-@pytest.mark.asyncio
-async def test_first_oversized_stdout_allows_retry_and_second_terminates(tmp_path: Path) -> None:
-    config = fake_config(tmp_path)
-    config.max_read = 1024
-    client = AcpClient(config)
-    await client.start()
-    try:
-        await client.begin_prompt("large-output")
-        with pytest.raises(AcpError, match="response was discarded") as first_error:
-            await client.wait_for_turn_event(5)
-        assert "larger max_read" in str(first_error.value)
-        assert "compress the answer" in str(first_error.value)
-        await client.cancel_turn()
-        assert client.running
-
-        await client.begin_prompt("short answer")
-        recovered = await client.wait_for_turn_event(5)
-        assert recovered["result"]["text"] == "echo:short answer"
-
-        await client.begin_prompt("large-output")
-        with pytest.raises(AcpError, match="response was discarded"):
-            await client.wait_for_turn_event(5)
-        await client.cancel_turn()
-        assert client.running
-
-        await client.begin_prompt("large-output")
-        with pytest.raises(AcpError, match="repeatedly exceeded"):
-            await client.wait_for_turn_event(5)
-        for _ in range(50):
-            if not client.running:
-                break
-            await asyncio.sleep(0.01)
-        assert not client.running
-    finally:
-        await client.close()
-
-
-@pytest.mark.asyncio
-async def test_zero_stdout_overflow_tolerance_terminates_on_first_overflow(tmp_path: Path) -> None:
-    config = fake_config(tmp_path)
-    config.max_read = 1024
-    config.stdout_overflow_retry_tolerance = 0
-    client = AcpClient(config)
-    await client.start()
-    try:
-        await client.begin_prompt("large-output")
-        with pytest.raises(AcpError, match="repeatedly exceeded"):
-            await client.wait_for_turn_event(5)
-        for _ in range(50):
-            if not client.running:
-                break
-            await asyncio.sleep(0.01)
-        assert not client.running
-    finally:
-        await client.close()
-
-
-@pytest.mark.asyncio
-async def test_oversized_stderr_line_is_discarded_without_stopping_session(tmp_path: Path) -> None:
-    config = fake_config(tmp_path)
-    config.max_read = 1024
-    client = AcpClient(config)
-    await client.start()
-    try:
-        await client.begin_prompt("large-stderr")
+        await client.begin_prompt("information")
+        event = await client.wait_for_turn_event(5)
+        information = event["interaction"]
+        assert information.kind == "information"
+        assert information.schema["required"] == ["value"]
+        await client.respond_interaction(information.request_id, {"value": "chosen"})
         completed = await client.wait_for_turn_event(5)
-        assert completed["result"]["text"] == "echo:large-stderr"
-        for _ in range(50):
-            if "discarded stderr line" in client.stderr_tail:
-                break
-            await asyncio.sleep(0.01)
-        assert "discarded stderr line" in client.stderr_tail
-        assert client.running
+        assert completed["result"]["text"].endswith(";answer:chosen")
+
+        await client.begin_prompt("elicitation")
+        event = await client.wait_for_turn_event(5)
+        elicitation = event["interaction"]
+        assert elicitation.response_style == "elicitation"
+        await client.respond_interaction(elicitation.request_id, {"value": "accepted"})
+        completed = await client.wait_for_turn_event(5)
+        assert completed["result"]["text"].endswith(";answer:accepted")
     finally:
         await client.close()
 
 
 @pytest.mark.asyncio
-async def test_remote_cleanup_validates_pid_before_kill(tmp_path: Path, monkeypatch) -> None:
-    config = SessionConfig(launch_mode="ssh", cwd=str(tmp_path), ssh_host="dev-box")
+async def test_authentication_can_complete_after_initialization(tmp_path: Path) -> None:
+    config = fake_config(tmp_path)
+    config.env["FAKE_AUTHENTICATED"] = "0"
     client = AcpClient(config)
-    captured: list[str] = []
-
-    class CleanupProcess:
-        async def wait(self) -> int:
-            return 0
-
-        def kill(self) -> None:
-            pass
-
-    async def fake_exec(*argv, **kwargs):
-        captured.extend(argv)
-        return CleanupProcess()
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    await client._cleanup_remote_process()
-
-    cleanup_command = captured[-1]
-    assert 'case "$pid" in ""|*[!0-9]*' in cleanup_command
-    assert "${TMPDIR:-/tmp}" in cleanup_command
-
-
-@pytest.mark.asyncio
-async def test_two_real_processes_are_isolated(tmp_path: Path) -> None:
-    first = AcpClient(fake_config(tmp_path))
-    second = AcpClient(fake_config(tmp_path))
-    await first.start()
-    await second.start()
+    await client.start_transport()
     try:
-        assert first.process is not None and second.process is not None
-        assert first.process.pid != second.process.pid
-        assert first.session_id != second.session_id
-
-        await first.begin_prompt("first")
-        await second.begin_prompt("second")
-        first_result = await first.wait_for_turn_event(5)
-        second_result = await second.wait_for_turn_event(5)
-        assert first_result["result"]["text"] == "echo:first"
-        assert second_result["result"]["text"] == "echo:second"
-    finally:
-        await first.close()
-        await second.close()
-
-
-@pytest.mark.real_codebuddy
-@pytest.mark.asyncio
-async def test_installed_codebuddy_acp_handshake(tmp_path: Path) -> None:
-    """Start actual CodeBuddy and verify ACP initialization/auth state handling."""
-    executable = shutil.which("codebuddy")
-    if executable is None:
-        pytest.skip("codebuddy is not installed")
-
-    client = AcpClient(
-        SessionConfig(
-            launch_mode="local",
-            cwd=str(tmp_path),
-            codebuddy_command=executable,
-            startup_timeout_seconds=120,
-        )
-    )
-    try:
-        await client.start()
-    except AcpError as exc:
-        assert "authentication required" in str(exc).lower()
-        assert client.process is not None
-    else:
-        assert client.running
-        assert client.session_id
+        assert (await client.get_auth_info()).authenticated is False
+        assert (await client.authenticate("browser")).authenticated is True
+        await client.open_session()
+        assert client.session_id == "fake-session"
     finally:
         await client.close()
 
 
-@pytest.mark.real_codebuddy
-@pytest.mark.model
 @pytest.mark.asyncio
-async def test_installed_codebuddy_model_prompt(tmp_path: Path) -> None:
-    """Opt-in test that sends a real prompt and may consume account quota."""
-    if os.environ.get("RUN_CODEBUDDY_MODEL_TEST") != "1":
-        pytest.skip("set RUN_CODEBUDDY_MODEL_TEST=1 to run the real model prompt")
-    executable = shutil.which("codebuddy")
-    if executable is None:
-        pytest.skip("codebuddy is not installed")
+async def test_closing_supervisor_kills_harness_process_group(tmp_path: Path) -> None:
+    pid_file = tmp_path / "pids.txt"
+    config = fake_config(tmp_path)
+    config.env["FAKE_CHILD_PID_FILE"] = str(pid_file)
+    client = AcpClient(config)
+    await client.start_transport()
+    await client.open_session()
+    for _ in range(100):
+        if pid_file.exists():
+            break
+        await asyncio.sleep(0.01)
+    harness_pid, child_pid = map(int, pid_file.read_text(encoding="utf-8").split())
+    assert client.process_info["transport_pgid"] == harness_pid
 
-    client = AcpClient(
-        SessionConfig(
-            launch_mode="local",
-            cwd=str(tmp_path),
-            codebuddy_command=executable,
-            codebuddy_args=["--tools", ""],
-            startup_timeout_seconds=120,
-        )
+    await client.close()
+
+    for _ in range(100):
+        if not _pid_exists(harness_pid) and not _pid_exists(child_pid):
+            break
+        await asyncio.sleep(0.02)
+    assert not _pid_exists(harness_pid)
+    assert not _pid_exists(child_pid)
+
+
+@pytest.mark.asyncio
+async def test_harness_exit_kills_its_remaining_background_processes(tmp_path: Path) -> None:
+    pid_file = tmp_path / "pids.txt"
+    config = fake_config(tmp_path)
+    config.env.update(
+        {"FAKE_CHILD_PID_FILE": str(pid_file), "FAKE_EXIT_AFTER_CHILD": "1"}
     )
-    await client.start()
+    client = AcpClient(config)
+    with pytest.raises(AcpError, match="stdout closed"):
+        await client.start_transport()
+    for _ in range(100):
+        if pid_file.exists():
+            break
+        await asyncio.sleep(0.01)
+    _harness_pid, child_pid = map(int, pid_file.read_text(encoding="utf-8").split())
+    for _ in range(100):
+        if not _pid_exists(child_pid):
+            break
+        await asyncio.sleep(0.02)
+    assert not _pid_exists(child_pid)
+
+
+def test_adapters_reject_detaching_and_managed_arguments(tmp_path: Path) -> None:
+    config = fake_config(tmp_path, "codebuddy")
+    config.args.append("--background")
+    with pytest.raises(ValueError, match="detach"):
+        get_adapter("codebuddy").build_argv(config)
+
+
+@pytest.mark.parametrize(
+    ("status", "authenticated"),
+    [
+        ({"type": "gateway", "name": "provider"}, True),
+        ({"type": "chat-gpt", "email": "user@example.invalid"}, True),
+        ({"type": "unauthenticated"}, False),
+    ],
+)
+def test_authentication_status_type_is_normalized(status: dict, authenticated: bool) -> None:
+    info = _normalize_auth_status({"result": status}, [])
+    assert info.authenticated is authenticated
+
+
+def _remote_spec(tmp_path: Path) -> dict:
+    return {
+        "cwd": str(tmp_path),
+        "argv": [sys.executable, str(FAKE_HARNESS)],
+        "harness_env": {"FAKE_NO_AUTH": "1"},
+        "remote_pid_file": "harness-acp-test.pid",
+        "terminate_grace_seconds": 0.01,
+        "remote_cleanup_timeout_seconds": 1,
+        "ssh_command": "ssh",
+        "ssh_args": [],
+        "ssh_host": "placeholder.invalid",
+    }
+
+
+def test_remote_wrapper_tracks_actual_process_group_and_has_valid_shell(tmp_path: Path) -> None:
+    command = _remote_command(_remote_spec(tmp_path))
+
+    assert "set -m" in command
+    assert "setsid" not in command
+    assert 'harness_pid=$!' in command
+    assert 'ps -o pgid= -p "$harness_pid"' in command
+    assert 'kill -TERM -"$harness_pgid"' in command
+    assert 'wait "$harness_pid"' in command
+    subprocess.run(["/bin/sh", "-n", "-c", command], check=True)
+
+
+@pytest.mark.asyncio
+async def test_remote_wrapper_keeps_stdio_open_until_harness_exits(tmp_path: Path) -> None:
+    command = _remote_command(_remote_spec(tmp_path))
+    env = os.environ.copy()
+    env["TMPDIR"] = str(tmp_path)
+    process = await asyncio.create_subprocess_exec(
+        "/bin/sh",
+        "-c",
+        command,
+        env=env,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    process.stdin.write(b'{"jsonrpc":"2.0","id":1,"method":"initialize"}\n')
+    await process.stdin.drain()
+    response = await asyncio.wait_for(process.stdout.readline(), 5)
+    assert b'"id":1' in response
+
+    pid_path = tmp_path / "harness-acp-test.pid"
+    for _ in range(100):
+        if pid_path.exists():
+            break
+        await asyncio.sleep(0.01)
+    process_id, process_group_id = pid_path.read_text(encoding="utf-8").split()
+    assert process_id.isdigit()
+    assert process_group_id.isdigit()
+
+    process.stdin.close()
+    await process.stdin.wait_closed()
+    await asyncio.wait_for(process.wait(), 5)
+    assert not pid_path.exists()
+
+
+def test_secondary_remote_cleanup_reads_and_kills_process_group(
+    monkeypatch, tmp_path: Path
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    _cleanup_remote(_remote_spec(tmp_path))
+
+    command = captured["argv"][-1]
+    assert 'read harness_pid harness_pgid' in command
+    assert 'kill -TERM -"$harness_pgid"' in command
+    assert 'kill -KILL -"$harness_pgid"' in command
+
+    config = fake_config(tmp_path, "codebuddy")
+    config.args.append("--model")
+    with pytest.raises(ValueError, match="managed"):
+        get_adapter("codebuddy").build_argv(config)
+
+
+def _pid_exists(pid: int) -> bool:
     try:
-        await client.begin_prompt("Reply with exactly: OK")
-        result = await client.wait_for_turn_event(300)
-        assert result["kind"] == "complete"
-        assert "OK" in result["result"]["text"]
-    finally:
-        await client.close()
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True

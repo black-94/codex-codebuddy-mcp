@@ -1,0 +1,47 @@
+schema_version: 1
+
+ipc:
+  socket_path: null
+  lock_path: null
+  connect_timeout_seconds: 2
+  daemon_start_timeout_seconds: 10
+
+daemon:
+  max_concurrency: 2
+  idle_session_timeout_seconds: 3600
+  reap_interval_seconds: 30
+
+authentication:
+  timeout_seconds: 600
+  max_concurrent_targets: 2
+  ledger_path: null
+  rate_limit:
+    enabled: true
+    min_interval_seconds: 60
+    max_attempts: 10
+    window_seconds: 86400
+
+interaction:
+  timeout_seconds: 900
+
+persistence:
+  sessions_path: null
+
+process:
+  startup_timeout_seconds: 60
+  turn_timeout_seconds: 1800
+  turn_cancel_timeout_seconds: 5
+  terminate_grace_seconds: 5
+  remote_cleanup_timeout_seconds: 10
+
+buffers:
+  max_read_bytes: 1MiB
+  max_output_bytes: 64KiB
+  stdout_overflow_retry_tolerance: 1
+  stderr_tail_lines: 200
+
+logging:
+  path: null
+  level: INFO
+  max_bytes: 10MiB
+  backup_count: 3

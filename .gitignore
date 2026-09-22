@@ -135,6 +135,12 @@ celerybeat.pid
 *.rdb
 *.aof
 *.pid
+*.pgid
+auth-rate.sqlite3*
+sessions.sqlite3*
+harness-acp-mcp.local.yaml
+daemon.sock
+daemon.lock
 
 # RabbitMQ
 mnesia/

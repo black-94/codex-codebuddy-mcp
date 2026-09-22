@@ -1,260 +1,111 @@
-# codex-codebuddy-mcp
+# harness-acp-mcp
 
-A minimal Python MCP server that lets Codex control CodeBuddy Code through its
-[Agent Client Protocol (ACP)](https://agentclientprotocol.com/) interface.
+`harness-acp-mcp` exposes local or SSH Agent Client Protocol harnesses to an MCP client.
+The MCP process is a thin stdio client; one per-user daemon owns all live sessions.
 
-## Features
-
-- Session creation starts CodeBuddy and establishes the ACP session.
-- One CodeBuddy process and ACP session per bridge session.
-- Local launch and remote launch over OpenSSH stdio.
-- Explicit bridge session IDs with MCP client ownership checks.
-- Per-session model switching through ACP.
-- At most two active CodeBuddy turns by default across the MCP server.
-- Explicit permission approval modes: MCP elicitation or compatible two-step flow.
-- Cancellation and deterministic child-process cleanup.
-
-## Requirements
-
-- Python 3.11 or newer
-- `uv`
-- CodeBuddy Code with ACP support (`codebuddy --acp`)
-- OpenSSH when using remote launch
+Supported harness identifiers are `codebuddy`, `agy`, and `codex`. Every session requires a
+working directory and model ID. Harness processes are supervised in dedicated process groups, so
+closing a session also closes supported child and background processes.
 
 ## Install and run
 
 ```bash
 uv sync
-uv run codex-codebuddy-mcp
+uv run harness-acp-mcp
 ```
 
-The bridge has built-in defaults. In a source checkout, the repository-level
-[`config.yaml`](config.yaml) can override them:
+The thin client starts `harness-acp-mcp-daemon` automatically. Running the daemon command directly
+is useful for diagnostics; the per-user lock prevents a second daemon from starting.
 
-```yaml
-max_read: 1048576 # 1 MiB, one ACP stdout/stderr line
-max_output: 65536 # 64 KiB, one MCP result
-max_concurrency: 2 # simultaneous active prompt turns
-approval_mode: elicitation
-timeout_seconds: 900 # default prompt/permission-turn timeout
-startup_timeout_seconds: 60 # ACP initialize/session startup timeout
-turn_cancel_timeout_seconds: 5 # wait for ACP turn cancellation
-local_process_terminate_timeout_seconds: 5 # wait before local SIGKILL
-remote_ssh_cleanup_timeout_seconds: 10 # wait for remote cleanup SSH command
-stdout_overflow_retry_tolerance: 1 # oversized stdout turns tolerated before termination
-stderr_tail_buffer_size: 80 # stderr lines retained for diagnostics
-```
-
-Installed wheels use the built-in defaults unless `CODEX_CODEBUDDY_MCP_CONFIG` names a YAML file.
-The `KB`, `MB`, and `GB` suffixes are accepted as binary multiples for backward compatibility;
-`max_concurrency` must be a unitless integer. The values can be overridden for an individual
-session by passing `max_read` and/or `max_output` to `create_codebuddy_session`. Timeout values
-are seconds. `stdout_overflow_retry_tolerance` is the number of oversized stdout responses that
-may be discarded while keeping the process available; `0` terminates the process on the first
-overflow. `stderr_tail_buffer_size` is measured in stderr lines. The prompt tools'
-`timeout_seconds` and the session creation tool's `startup_timeout_seconds` also accept per-call
-overrides.
-`max_concurrency` applies globally to all bridge sessions and is loaded when the MCP server starts.
-
-Example Codex MCP configuration:
+Codex MCP configuration:
 
 ```toml
-[mcp_servers.codebuddy]
+[mcp_servers.harness_acp]
 command = "uv"
-args = [
-  "run",
-  "--project",
-  "/absolute/path/to/codex-codebuddy-mcp",
-  "codex-codebuddy-mcp",
-]
+args = ["run", "--project", "<bridge-directory>", "harness-acp-mcp"]
 ```
 
-The MCP server writes protocol data to stdout and diagnostics to stderr.
+Copy `config.example.yaml` to the user configuration directory or set
+`HARNESS_ACP_MCP_CONFIG` to a local YAML file. Local configuration, logs, sockets, process files,
+and the authentication-rate database must not be committed.
 
 ## Tools
 
-### `create_codebuddy_session`
+- `create_session`: launch `codebuddy`, `agy`, or `codex` locally or through SSH.
+- `authenticate`: run one advertised ACP authentication method.
+- `get_user_info`: return a reliable login boolean and optional account details.
+- `set_model`: switch the required session model between turns.
+- `prompt`: run a prompt and prefer MCP elicitation for permission and information requests.
+- `respond_interaction`: compatibility response when the MCP client lacks elicitation.
+- `cancel_turn`: stop the current turn without closing the session.
+- `close_session`: close the supervisor and complete harness process group.
 
-Starts CodeBuddy, establishes the ACP session, and returns both a `bridge_session_id` and the
-`codebuddy_session_id`, along with the ACP-reported `model_id` and `model_name`. The model fields
-are returned when the session is created, not repeated on every prompt result. The bridge does not
-maintain a model allowlist. If CodeBuddy does not report model metadata, those two fields are
-`null`, rather than echoing an unverified model argument. If startup or session recovery fails,
-this call returns an error and does not leave a usable bridge session behind.
-
-`cwd` and `model_id` are required. `cwd` sets the working directory for the CodeBuddy session. If it
-is present but empty or contains only whitespace, the bridge asks the user to enter a working
-directory through MCP elicitation. Clients without elicitation support receive an error that asks
-the caller to retry with a non-empty `cwd`. `model_id` must be non-empty and is passed to CodeBuddy
-as `--model`; do not repeat `--model` in `codebuddy_args`.
-
-Local example arguments:
+Local session example:
 
 ```json
 {
-  "cwd": "/path/to/project",
-  "model_id": "deepseek-v4.1-flash",
+  "harness": "codex",
+  "cwd": "<project-directory>",
+  "model_id": "<model-id>",
   "launch_mode": "local",
-  "permission_mode": "auto",
-  "approval_mode": "elicitation",
-  "max_read": 4194304,
-  "max_output": 65536
+  "command": "<harness-command>"
 }
 ```
 
-SSH example arguments:
+SSH authentication is delegated to the installed SSH client, its agent, and user-owned SSH
+configuration. An SSH session additionally requires `ssh_host`; use a local alias or target supplied
+at runtime rather than recording deployment details in this repository.
 
-```json
-{
-  "cwd": "/home/dev/project",
-  "model_id": "deepseek-v4.1-flash",
-  "launch_mode": "ssh",
-  "ssh_host": "dev-box",
-  "ssh_args": ["-T"],
-  "codebuddy_command": "/usr/local/bin/codebuddy"
-}
-```
+`create_session` returns process-group launch metadata plus a `session_record_id`. The daemon writes
+a private `0600` record outside the repository. A later `create_session` may pass that value as
+`resume_record_id`; the bridge resolves the saved harness session ID and requests ACP `session/load`.
+The caller still supplies `harness`, `cwd`, and `model_id`, so reconnecting never silently selects a
+working directory or model. Environment values and argument values are not persisted; only
+environment names and the argument count are recorded.
 
-SSH authentication uses the system `ssh` command, SSH config, and agent. Passwords are not
-accepted by this bridge. Values supplied through `env` are forwarded to CodeBuddy but should be
-treated as MCP tool input; prefer parent-process or remote host configuration for secrets.
+Model identifiers remain harness-specific. In particular, current `codex-acp` releases may require
+the `model[effort]` form; callers must pass the exact identifier accepted by the selected harness.
 
-`approval_mode` controls the bridge-to-MCP permission path. `elicitation` is the default and requires
-the MCP client to support elicitation; failures are returned as errors. `compatible` explicitly uses
-the two-step `permission_required` plus `respond_codebuddy_permission` flow. It does not silently
-fall back between modes.
+## Authentication and interactions
 
-By default the bridge reuses the CodeBuddy login already present on the target machine. If no login
-is available it returns an authentication-required error. `auth_method_id` can explicitly request
-`external`, `internal`, `iOA`, or `selfhosted` authentication; CodeBuddy may open or wait for its
-normal login flow, so use this only when interactive authentication is intended.
+An unauthenticated `create_session` returns `authentication_required` while retaining the initialized
+ACP process. `authenticate` is serialized per harness and target. Frequency limiting is configurable
+and may be disabled, but same-target serialization always remains enabled to prevent concurrent
+credential-state writes. Authentication timeout closes the entire session process group.
 
-`permission_mode` defaults to `auto` and is passed to CodeBuddy as `--permission-mode auto`. The
-supported values are `acceptEdits`, `bypassPermissions`, `default`, `plan`, `dontAsk`, and `auto`.
-The bridge allows `max_concurrency` active turns at the same time across sessions; turns in one ACP
-session remain serialized. `max_read` controls the `asyncio` subprocess stream limit used for
-reading each ACP stdout/stderr line. Its YAML default is `1048576` bytes (1 MiB). Increase it when
-a single ACP JSON line can be larger; it must be a positive integer. On the first stdout overrun,
-the bridge discards that response, cancels the current turn, and keeps the process available so the
-caller can request a compressed answer. Changing `max_read` requires creating a new bridge session.
-A successful turn clears the overrun count; once `stdout_overflow_retry_tolerance` is exceeded,
-the process is terminated.
-Oversized stderr lines are discarded without stopping the session. `max_output` controls the MCP
-result threshold and defaults to `65536` bytes (64 KiB).
+When the MCP client supports elicitation, permission and structured information requests are shown
+through elicitation even if the harness itself uses a two-message request/response protocol. Without
+elicitation, `prompt` or `authenticate` returns `interaction_required`; the caller supplies the
+answer with `respond_interaction`. This status means an application-level request/response pause,
+not two-factor authentication. The bridge never silently approves a permission request.
 
-The concurrency limit applies to active `session/prompt` turns, including turns waiting for a
-permission decision. It does not limit the number of started CodeBuddy processes. A third session
-may be created and remain ready, but its prompt waits for a turn slot and fails when its timeout
-expires. In compatible approval mode, an unanswered permission request is cancelled after the
-calling tool's `timeout_seconds`, which releases its global turn slot. Operations within one bridge
-session are serialized by that session's lock.
+## Process lifecycle
 
-The registry is in memory. Restarting the MCP server loses bridge session IDs, owner bindings,
-locks, pending permissions, in-flight buffers, and process handles. Persist the returned
-`codebuddy_session_id` if recovery is needed; a new bridge session can pass it as
-`resume_session_id`. The bridge cannot discover old CodeBuddy sessions automatically.
+Local harnesses run in their own process groups. A separate session supervisor watches its daemon
+control pipe; daemon loss, harness exit, explicit close, or timeout triggers group-wide TERM followed
+by KILL. SSH wrappers enable shell job control, record the actual remote process-group ID, install exit
+traps, and perform a second cleanup connection when needed.
 
-### `switch_codebuddy_model`
-
-Switches the model for an existing bridge session between turns:
-
-```json
-{
-  "bridge_session_id": "...",
-  "model_id": "deepseek-v4.1-flash"
-}
-```
-
-The bridge sends ACP `session/set_model` with the bound CodeBuddy session. CodeBuddy must
-acknowledge the change; ACP errors are returned directly and do not change the bridge's recorded
-model. A successful call returns `model_id` and `model_name` once, together with both session IDs.
-Switching while a prompt or permission request is active is rejected; finish or cancel that turn
-first.
-
-### `prompt_codebuddy`
-
-Sends a text prompt to the already-started CodeBuddy session. A completed turn returns the final text,
-stop reason, tool summaries, and CodeBuddy session ID.
-
-`max_output` controls the maximum UTF-8 byte size of every prompt result and defaults to `65536`.
-When the serialized result is larger, the bridge writes the complete JSON result to a `0600` file in
-the local temporary directory and returns `output_path`, `output_bytes`, and
-`text_available_in_file=true` instead of embedding the large text in the MCP response. Permission
-metadata remains in the compact response so the caller can continue the same turn; the caller can
-read the complete result from that path with its local file tools. MCP/JSON-RPC does not define one
-universal maximum, but the calling Codex or harness may enforce a per-message limit, so a
-conservative `max_output` is useful for long reports. The bridge removes tracked output files when
-their bridge session closes or the server shuts down.
-
-For reports that exceed the file threshold, the same bridge session remains available for follow-up
-prompts and additional sections.
-
-With `approval_mode="compatible"`, the tool returns:
-
-```json
-{
-  "status": "permission_required",
-  "permission": {
-    "request_id": "...",
-    "tool_name": "Bash",
-    "raw_input": {"command": "..."},
-    "options": [
-      {"kind": "allow", "name": "Allow", "optionId": "allow"},
-      {"kind": "reject", "name": "Deny", "optionId": "deny"}
-    ]
-  }
-}
-```
-
-### `respond_codebuddy_permission`
-
-Pass the exact `request_id` and one of the returned `optionId` values. The call continues the same
-CodeBuddy turn and may complete or return another permission request. It also accepts `max_output`
-with the same file externalization behavior.
-
-### `cancel_codebuddy_turn` and `close_codebuddy_session`
-
-Completing a prompt does not close CodeBuddy. Cancellation keeps the CodeBuddy process available.
-Closing cancels active work, terminates the local process or SSH channel, and removes the bridge
-session. On SSH, the bridge records a unique remote PID file and performs a second SSH cleanup command
-that terminates that process group. The remote shell uses `set -m`, starts CodeBuddy as a monitored
-job, and waits for it so the SSH stdio channel stays connected for ACP responses. This handles
-CodeBuddy processes that outlive the SSH channel; abrupt network loss or a remote process that
-ignores termination cannot be guaranteed by the local client.
+Options that intentionally detach a harness, including background and terminal-multiplexer modes,
+are rejected. A third-party process that deliberately creates a new session outside the managed
+group is outside the supported lifecycle contract.
 
 ## Tests
 
-Run the default suite, including a real installed CodeBuddy ACP handshake:
-
 ```bash
-uv run pytest
-```
-
-The handshake starts the actual `codebuddy-code` binary, validates ACP initialization and login
-state handling, and creates an ACP session when the installed CLI is already authenticated. It does
-not send a model prompt or consume model quota. A second real startup test verifies that the default
-permission mode passed to CodeBuddy is `auto`, rather than `plan`. These tests skip only when
-`codebuddy` is not installed.
-
-An opt-in end-to-end model test is also provided. It sends a real prompt and may consume quota:
-
-```bash
-RUN_CODEBUDDY_MODEL_TEST=1 uv run pytest -m model
-```
-
-The real permission-forwarding test is parameterized over both supported forwarding modes. It
-prompts CodeBuddy to request approval for a harmless `printf` through Bash, verifies either the
-compatible two-step response or MCP elicitation, selects an allow option, and checks that the same
-turn completes. It is separately opt-in because each mode sends a model prompt and executes the
-approved command:
-
-```bash
-RUN_CODEBUDDY_PERMISSION_TEST=1 uv run pytest \
-  tests/test_server.py::test_real_codebuddy_permission_request_is_forwarded
-```
-
-Run static checks:
-
-```bash
+uv run pytest -m "not real_codebuddy and not real_codex and not model"
 uv run ruff check .
 ```
+
+Real-harness tests are separately marked because interactive authentication, model prompts, and
+approved commands can have account or machine side effects. No test performs an account-usage reset.
+The real tests take model identifiers from `HARNESS_ACP_REAL_CODEBUDDY_MODEL` and
+`HARNESS_ACP_REAL_CODEX_MODEL`; model and permission turns additionally require their explicit
+`RUN_HARNESS_ACP_REAL_MODEL_TEST` or `RUN_HARNESS_ACP_REAL_PERMISSION_TEST` opt-in flag.
+
+## Repository privacy
+
+Tracked files must not contain private deployment configuration, real account names, machine names,
+network addresses, home-directory paths, or personal project and file names. Documentation uses
+placeholders; tests use temporary paths and generated identifiers. Run the tracked-content privacy
+scan before publishing changes.

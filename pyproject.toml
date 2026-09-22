@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "codex-codebuddy-mcp"
-version = "0.1.0"
-description = "A minimal MCP bridge from Codex to CodeBuddy Code's ACP server"
+name = "harness-acp-mcp"
+version = "0.2.0"
+description = "An isolated MCP bridge for local and SSH ACP harness processes"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
@@ -14,7 +14,8 @@ dependencies = [
 ]
 
 [project.scripts]
-codex-codebuddy-mcp = "codex_codebuddy_mcp.server:main"
+harness-acp-mcp = "harness_acp_mcp.server:main"
+harness-acp-mcp-daemon = "harness_acp_mcp.daemon:main"
 
 [dependency-groups]
 dev = [
@@ -24,13 +25,14 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/codex_codebuddy_mcp"]
+packages = ["src/harness_acp_mcp"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
   "real_codebuddy: uses an installed CodeBuddy Code executable",
+  "real_codex: uses an installed codex-acp executable",
   "model: sends a real model prompt and may consume account quota",
 ]
 
@@ -40,4 +42,3 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
-
