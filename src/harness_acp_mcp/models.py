@@ -4,8 +4,56 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Literal, TextIO
 
+from .privacy import public_account
+
 HarnessName = Literal["codebuddy", "agy", "codex"]
 LaunchMode = Literal["local", "ssh"]
+
+
+@dataclass(frozen=True, slots=True)
+class DockerMount:
+    """One explicit host-directory bind mount for a Docker container."""
+
+    source: str
+    target: str
+    read_only: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"source": self.source, "target": self.target, "read_only": self.read_only}
+
+
+@dataclass(frozen=True, slots=True)
+class DockerPort:
+    """One published container port; ``host_ip`` is the optional host bind address."""
+
+    host_port: int
+    container_port: int
+    protocol: Literal["tcp", "udp"] = "tcp"
+    host_ip: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "host_ip": self.host_ip,
+            "host_port": self.host_port,
+            "container_port": self.container_port,
+            "protocol": self.protocol,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ContainerInspection:
+    """Docker configuration read back from ``docker inspect`` for a retained container.
+
+    It mirrors the four creation-time Docker options so a reused container's
+    ``launch_info`` reports the values the container actually holds instead of
+    guessed defaults. Only these fields are projected out of ``docker inspect``;
+    the full payload (including container environment) is never echoed.
+    """
+
+    image: str
+    mounts: tuple[DockerMount, ...] = ()
+    ports: tuple[DockerPort, ...] = ()
+    host_network: bool = False
 
 
 @dataclass(slots=True)
@@ -15,22 +63,36 @@ class SessionConfig:
     cwd: str
     model_id: str
     command: str
+    runtime: Literal["direct", "docker"] = "direct"
+    permission_mode: Literal["read", "edit", "auto", "bypass"] = "auto"
+    acp_mode_id: str | None = None
+    docker_command: str = "docker"
+    docker_image: str | None = None
+    docker_container_name: str | None = None
+    docker_id: str | None = None
+    docker_mounts: tuple[DockerMount, ...] = ()
+    docker_ports: tuple[DockerPort, ...] = ()
+    docker_host_network: bool = False
+    container_policy: Literal["remove", "keep"] = "remove"
+    reuse_container: bool = False
+    # Populated for a reused container from ``docker inspect`` before the session is
+    # created, so ``launch_info`` can report its real image, mounts, ports, and
+    # network mode. It stays ``None`` for a newly created container.
+    container_inspection: ContainerInspection | None = None
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     ssh_host: str | None = None
     ssh_command: str = "ssh"
-    ssh_args: list[str] = field(default_factory=list)
     resume_session_id: str | None = None
-    harness_options: dict[str, Any] = field(default_factory=dict)
     startup_timeout_seconds: float = 60.0
     auth_timeout_seconds: float = 600.0
     turn_cancel_timeout_seconds: float = 5.0
     terminate_grace_seconds: float = 5.0
     remote_cleanup_timeout_seconds: float = 10.0
-    stdout_overflow_retry_tolerance: int = 1
     stderr_tail_lines: int = 200
-    max_read_bytes: int = 1024 * 1024
-    max_output_bytes: int = 64 * 1024
+    max_read_bytes: int = 100 * 1024 * 1024
+    max_output_bytes: int = 128 * 1024
+    output_log_directory: str | None = None
 
 
 @dataclass(slots=True)
@@ -41,10 +103,12 @@ class AuthInfo:
     raw: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
+        # ``user`` is rebuilt from the account whitelist so credentials a harness puts
+        # in the account object can never reach an MCP result.
         return {
             "authenticated": self.authenticated,
             "auth_methods": self.methods,
-            "user": self.user,
+            "user": public_account(self.user),
         }
 
 

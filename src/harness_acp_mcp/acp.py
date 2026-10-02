@@ -15,26 +15,70 @@ from typing import Any
 
 from .adapters import AuthStatusUnsupported, get_adapter
 from .models import AuthInfo, InteractionRequest, SessionConfig, TurnBuffers
+from .output_log import HarnessOutputLog
+from .privacy import redact_sensitive
 from .supervisor import SPEC_ENV
 
 logger = logging.getLogger(__name__)
+
+# Bound the work spent on misbehaving harness output so a harness that keeps emitting
+# over-limit lines cannot spin the reader forever. Within the bound only the offending
+# line is dropped; beyond it the transport is closed.
+MAX_CONSECUTIVE_OVERSIZED_LINES = 32
+OVERSIZED_LINE_BYTE_BUDGET_MULTIPLIER = 8
 
 
 class AcpError(RuntimeError):
     """ACP transport, lifecycle, or peer error."""
 
 
+class AcpDiscardLimitExceeded(AcpError):
+    """Over-limit output exceeded the bounded discard budget and the transport was closed."""
+
+
+class AcpLineTooLarge(AcpError):
+    """One ACP stdout line exceeded max_read_bytes and was discarded."""
+
+    def __init__(self, limit: int, *, turn_active: bool = False) -> None:
+        self.limit = limit
+        self.turn_active = turn_active
+        super().__init__(
+            f"ACP JSON line exceeded max_read_bytes ({limit} bytes); only that line was discarded "
+            "and cancellation of the current turn was attempted."
+        )
+
+    def as_error(self) -> dict[str, Any]:
+        """Return the structured English error reported to the MCP caller."""
+        warning = (
+            "Only the oversized line was discarded and subsequent lines are still read. "
+            "Turn cancellation is best effort and cannot be guaranteed: if the discarded line "
+            "was a permission or information request, its JSON-RPC request ID is unavailable, so "
+            "a harness that does not honor session/cancel can remain waiting for a reply. Close "
+            "the session if it does not recover."
+        )
+        return {
+            "code": "acp_json_line_too_large",
+            "message": str(self),
+            "max_read_bytes": self.limit,
+            "discarded_line_only": True,
+            "turn_cancelled": "best_effort" if self.turn_active else "not_needed",
+            "warning": warning,
+        }
+
+
 class AcpRpcError(AcpError):
     def __init__(self, error: Any) -> None:
         self.error = error
         self.code = error.get("code") if isinstance(error, dict) else None
-        super().__init__(f"ACP request failed: {error!r}")
+        super().__init__(f"ACP request failed: {redact_sensitive(error)!r}")
 
 
 async def _readline_discarding_overflow(
     reader: asyncio.StreamReader,
+    max_discard_bytes: int | None = None,
 ) -> tuple[bytes, bool]:
     overflowed = False
+    discarded = 0
     while True:
         try:
             line = await reader.readuntil(b"\n")
@@ -42,7 +86,15 @@ async def _readline_discarding_overflow(
             return (b"" if overflowed else exc.partial), overflowed
         except asyncio.LimitOverrunError as exc:
             overflowed = True
-            await reader.readexactly(exc.consumed or 1)
+            consumed = exc.consumed or 1
+            discarded += consumed
+            if max_discard_bytes is not None and discarded > max_discard_bytes:
+                raise AcpDiscardLimitExceeded(
+                    "a single ACP line grew past the bounded discard budget "
+                    f"({max_discard_bytes} bytes, counting the whole line); "
+                    "the transport was closed"
+                ) from None
+            await reader.readexactly(consumed)
             continue
         return (b"" if overflowed else line), overflowed
 
@@ -59,9 +111,9 @@ class AcpClient:
         self.model_name: str | None = None
         self.auth_info: AuthInfo | None = None
         self._model_names: dict[str, str] = {}
-        self._last_auth_status: dict[str, Any] | None = None
         self._next_id = 1
         self._pending: dict[int | str, asyncio.Future[dict[str, Any]]] = {}
+        self._pending_methods: dict[int | str, str] = {}
         self._write_lock = asyncio.Lock()
         self._cancel_lock = asyncio.Lock()
         self._terminate_lock = asyncio.Lock()
@@ -69,10 +121,14 @@ class AcpClient:
         self._stderr_task: asyncio.Task[None] | None = None
         self._interaction_queue: asyncio.Queue[InteractionRequest] = asyncio.Queue()
         self._stderr_tail: deque[str] = deque(maxlen=config.stderr_tail_lines)
+        self.output_log = HarnessOutputLog(
+            directory=(
+                Path(config.output_log_directory) if config.output_log_directory else None
+            )
+        )
         self._turn_buffers = TurnBuffers(spool_max_size=config.max_output_bytes)
         self._turn_task: asyncio.Task[dict[str, Any]] | None = None
         self.pending_interaction: InteractionRequest | None = None
-        self._stdout_limit_failures = 0
         self._closed = False
         self._remote_pid_file = (
             f"harness-acp-{uuid.uuid4().hex}.pid" if config.launch_mode == "ssh" else None
@@ -111,14 +167,32 @@ class AcpClient:
             return {}
 
     def _supervisor_spec(self) -> dict[str, Any]:
+        argv = self.adapter.build_argv(self.config)
+        if self.config.runtime == "docker":
+            argv = [
+                self.config.docker_command,
+                "exec", "-i",
+                "--workdir", self.config.cwd,
+                self.config.docker_container_name,
+                *argv,
+            ]
         return {
             "launch_mode": self.config.launch_mode,
-            "argv": self.adapter.build_argv(self.config),
+            "argv": argv,
             "cwd": self.config.cwd,
             "harness_env": self.config.env,
+            "docker_command": self.config.docker_command,
+            "docker_image": self.config.docker_image,
+            "docker_id": self.config.docker_id,
+            "docker_container_name": self.config.docker_container_name,
+            "docker_mounts": [mount.as_dict() for mount in self.config.docker_mounts],
+            "docker_ports": [port.as_dict() for port in self.config.docker_ports],
+            "docker_host_network": self.config.docker_host_network,
+            "container_policy": self.config.container_policy,
+            "reuse_container": self.config.reuse_container,
+            "startup_timeout_seconds": self.config.startup_timeout_seconds,
             "ssh_host": self.config.ssh_host,
             "ssh_command": self.config.ssh_command,
-            "ssh_args": self.config.ssh_args,
             "remote_pid_file": self._remote_pid_file,
             "terminate_grace_seconds": self.config.terminate_grace_seconds,
             "remote_cleanup_timeout_seconds": self.config.remote_cleanup_timeout_seconds,
@@ -239,6 +313,22 @@ class AcpClient:
         if not isinstance(session_id, str) or not session_id:
             raise AcpError(f"harness did not return a sessionId: {response!r}")
         self.session_id = session_id
+        if self.config.harness == "codex":
+            mode = {
+                "read": "read-only",
+                "edit": "agent",
+                "auto": "agent",
+                "bypass": "agent-full-access",
+            }[self.config.permission_mode]
+            await self.request(
+                "session/set_config_option",
+                {"sessionId": session_id, "configId": "mode", "value": mode},
+            )
+        elif self.config.harness == "agy" and self.config.acp_mode_id:
+            await self.request(
+                "session/set_mode",
+                {"sessionId": session_id, "modeId": self.config.acp_mode_id},
+            )
         if self.config.harness != "codebuddy":
             await self.set_model(self.config.model_id)
         elif self.model_id is None:
@@ -280,6 +370,7 @@ class AcpClient:
         self._next_id += 1
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
+        self._pending_methods[request_id] = method
         try:
             await self._send(
                 {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
@@ -287,6 +378,7 @@ class AcpClient:
             return await future
         finally:
             self._pending.pop(request_id, None)
+            self._pending_methods.pop(request_id, None)
 
     async def notify(self, method: str, params: dict[str, Any]) -> None:
         await self._send({"jsonrpc": "2.0", "method": method, "params": params})
@@ -350,7 +442,6 @@ class AcpClient:
                 if self._turn_task is turn_task:
                     self._turn_task = None
                 self.pending_interaction = None
-                self._stdout_limit_failures = 0
                 result = response.get("result", {})
                 stop_reason = result.get("stopReason") if isinstance(result, dict) else None
                 return {
@@ -479,6 +570,7 @@ class AcpClient:
                 task.cancel()
         self._fail_pending(AcpError("harness ACP client closed"))
         self._pending.clear()
+        self._pending_methods.clear()
         self._turn_buffers.close()
         with suppress(FileNotFoundError):
             os.unlink(self._metadata_path)
@@ -523,42 +615,27 @@ class AcpClient:
 
     async def _read_stdout(self) -> None:
         assert self.process is not None and self.process.stdout is not None
+        max_discard = self.config.max_read_bytes * OVERSIZED_LINE_BYTE_BUDGET_MULTIPLIER
+        consecutive_oversized = 0
         try:
             while True:
-                line, overflowed = await _readline_discarding_overflow(self.process.stdout)
+                line, overflowed = await _readline_discarding_overflow(
+                    self.process.stdout, max_discard_bytes=max_discard
+                )
                 if overflowed:
-                    self._stdout_limit_failures += 1
-                    tolerated = (
-                        self._stdout_limit_failures
-                        <= self.config.stdout_overflow_retry_tolerance
-                    )
-                    if tolerated:
-                        failure = AcpError(
-                            "ACP stdout line exceeded "
-                            f"max_read_bytes={self.config.max_read_bytes}; the response was "
-                            "discarded and the turn was cancelled"
-                        )
-                    else:
-                        failure = AcpError(
-                            "ACP stdout repeatedly exceeded "
-                            f"max_read_bytes={self.config.max_read_bytes}; the process was closed"
-                        )
-                    self._fail_pending(failure)
-                    self.pending_interaction = None
-                    self._drain_interaction_queue()
-                    if tolerated:
-                        if self.session_id and self.running:
-                            with suppress(Exception):
-                                await self.notify("session/cancel", {"sessionId": self.session_id})
-                        continue
-                    await self._terminate_supervisor()
-                    return
+                    consecutive_oversized += 1
+                    self._check_oversized_flood("stdout", consecutive_oversized)
+                    await self._handle_oversized_line()
+                    continue
                 if not line:
                     break
+                consecutive_oversized = 0
                 try:
                     message = json.loads(line)
                 except json.JSONDecodeError as exc:
-                    raise AcpError(f"invalid ACP JSON: {line[:200]!r}") from exc
+                    preview = redact_sensitive(line[:200].decode(errors="replace"))
+                    raise AcpError(f"invalid ACP JSON: {preview!r}") from exc
+                await self._track_output("stdout", message)
                 await self._dispatch(message)
         except asyncio.CancelledError:
             raise
@@ -571,22 +648,80 @@ class AcpClient:
 
     async def _read_stderr(self) -> None:
         assert self.process is not None and self.process.stderr is not None
+        max_discard = self.config.max_read_bytes * OVERSIZED_LINE_BYTE_BUDGET_MULTIPLIER
+        consecutive_oversized = 0
         try:
             while True:
-                line, overflowed = await _readline_discarding_overflow(self.process.stderr)
+                line, overflowed = await _readline_discarding_overflow(
+                    self.process.stderr, max_discard_bytes=max_discard
+                )
                 if overflowed:
+                    consecutive_oversized += 1
+                    self._check_oversized_flood("stderr", consecutive_oversized)
                     self._stderr_tail.append(
                         "[discarded stderr line exceeding configured read limit]"
                     )
+                    await self._track_output("stderr", {
+                        "error": "Stderr line exceeded the configured read limit.",
+                    })
                     continue
                 if not line:
                     break
-                self._stderr_tail.append(line.decode(errors="replace").rstrip())
+                consecutive_oversized = 0
+                decoded = line.decode(errors="replace").rstrip()
+                # The stderr tail can be surfaced to callers in error messages, so it is
+                # redacted before it is retained or persisted.
+                safe = redact_sensitive(decoded)
+                self._stderr_tail.append(safe)
+                await self._track_output("stderr", safe)
         except asyncio.CancelledError:
             raise
+        except AcpDiscardLimitExceeded as exc:
+            logger.error("ACP stderr reader stopped: %s", exc)
+            self._fail_pending(exc)
+            await self._terminate_supervisor()
         except Exception as exc:
             logger.error("ACP stderr reader failed", exc_info=True)
             self._fail_pending(exc)
+
+    def _check_oversized_flood(self, stream: str, consecutive_oversized: int) -> None:
+        if consecutive_oversized > MAX_CONSECUTIVE_OVERSIZED_LINES:
+            raise AcpDiscardLimitExceeded(
+                f"harness produced more than {MAX_CONSECUTIVE_OVERSIZED_LINES} consecutive ACP "
+                f"{stream} lines exceeding max_read_bytes; the transport was closed to bound "
+                "discard work"
+            )
+
+    async def _track_output(self, stream: str, value: Any) -> None:
+        try:
+            # Authentication responses can contain live credentials; redact
+            # credential-looking keys before the record is persisted to disk.
+            await self.output_log.append(stream, redact_sensitive(value))
+        except OSError:
+            logger.warning("could not append to harness output log", exc_info=True)
+
+    async def _handle_oversized_line(self) -> None:
+        """Discard an over-limit line, release waiting callers, and cancel the turn.
+
+        Cancellation is best effort: the discarded line's JSON-RPC request ID is gone, so an
+        unanswered permission or information request cannot be replied to directly.
+        """
+        failure = AcpLineTooLarge(self.config.max_read_bytes, turn_active=self.turn_active)
+        logger.warning(
+            "discarded ACP stdout line exceeding max_read_bytes=%d", self.config.max_read_bytes
+        )
+        await self._track_output(
+            "stdout",
+            {
+                "error": "ACP stdout line exceeded max_read_bytes and was discarded.",
+                "max_read_bytes": self.config.max_read_bytes,
+                "turn_cancelled": "best_effort" if failure.turn_active else "not_needed",
+            },
+        )
+        self._fail_ambiguous_line(failure)
+        if failure.turn_active:
+            with suppress(Exception):
+                await self.cancel_turn()
 
     async def _dispatch(self, message: Any) -> None:
         if not isinstance(message, dict):
@@ -624,10 +759,6 @@ class AcpClient:
             return
         if method == "session/update":
             self._record_update(message.get("params", {}).get("update"))
-        elif method == "_auth/status_update":
-            params = message.get("params")
-            if isinstance(params, dict):
-                self._last_auth_status = params.get("authStatus")
 
     def _parse_permission(self, message: dict[str, Any]) -> InteractionRequest:
         params = message.get("params") or {}
@@ -697,6 +828,17 @@ class AcpClient:
     def _fail_pending(self, exc: BaseException) -> None:
         for future in self._pending.values():
             if not future.done():
+                future.set_exception(exc)
+
+    def _fail_ambiguous_line(self, exc: BaseException) -> None:
+        prompt_ids = [
+            request_id for request_id, method in self._pending_methods.items()
+            if method == "session/prompt"
+        ]
+        affected = prompt_ids or list(self._pending)
+        for request_id in affected:
+            future = self._pending.get(request_id)
+            if future is not None and not future.done():
                 future.set_exception(exc)
 
     def _drain_interaction_queue(self) -> None:

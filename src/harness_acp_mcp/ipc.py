@@ -12,6 +12,21 @@ from contextlib import suppress
 from .config import Settings
 
 
+def _omit_empty_fields(value: object) -> object:
+    """Drop empty fields from a daemon result.
+
+    Empty strings, lists, mappings, and ``None`` are removed. Meaningful falsy values
+    such as ``false`` and ``0`` are kept, so a Docker ``launch_info`` reports
+    ``host_network: false`` while an empty ``mounts``/``ports`` list is omitted.
+    """
+    if isinstance(value, dict):
+        compact = {key: _omit_empty_fields(item) for key, item in value.items()}
+        return {key: item for key, item in compact.items() if item not in (None, "", [], {})}
+    if isinstance(value, list):
+        return [_omit_empty_fields(item) for item in value]
+    return value
+
+
 class DaemonRpcError(RuntimeError):
     def __init__(self, error: dict[str, object]) -> None:
         self.error = error
@@ -100,4 +115,4 @@ class DaemonClient:
         result = response.get("result")
         if not isinstance(result, dict):
             raise ConnectionError("daemon returned an invalid result")
-        return result
+        return _omit_empty_fields(result)

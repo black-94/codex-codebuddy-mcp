@@ -128,7 +128,7 @@ async def test_installed_codebuddy_permission_round_trip(tmp_path) -> None:
             model_id=model_id,
             command=executable,
             args=["--tools", "Bash"],
-            harness_options={"permission_mode": "default"},
+            permission_mode="read",
             startup_timeout_seconds=120,
             turn_cancel_timeout_seconds=5,
             terminate_grace_seconds=2,

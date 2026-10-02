@@ -11,7 +11,23 @@ from typing import Any
 
 CONFIG_ENV = "HARNESS_ACP_MCP_CONFIG"
 SCHEMA_VERSION = 1
+# One create_session can sequentially spend a startup timeout on Docker inspect, on
+# container startup, and on ACP initialization before it is done.
+CREATE_SESSION_TIMEOUT_PHASES = 3
+CREATE_SESSION_TIMEOUT_GRACE_SECONDS = 30.0
+# Extra IPC margin so the daemon always aborts and cleans up before the caller gives up.
+CREATE_SESSION_IPC_GRACE_SECONDS = 15.0
 _SIZE = re.compile(r"^(?P<number>[0-9]+)\s*(?P<unit>b|kb|kib|mb|mib|gb|gib)?$", re.I)
+
+
+def create_session_timeout_seconds(startup_timeout_seconds: float) -> float:
+    """Overall budget for one create_session, shared by the daemon and the MCP caller."""
+    return (
+        startup_timeout_seconds * CREATE_SESSION_TIMEOUT_PHASES
+        + CREATE_SESSION_TIMEOUT_GRACE_SECONDS
+    )
+
+
 _MULTIPLIERS = {
     "b": 1,
     "kb": 1024,
@@ -49,7 +65,6 @@ def _config_dir() -> Path:
 class IpcSettings:
     socket_path: str = field(default_factory=lambda: str(_runtime_dir() / "daemon.sock"))
     lock_path: str = field(default_factory=lambda: str(_runtime_dir() / "daemon.lock"))
-    connect_timeout_seconds: float = 2.0
     daemon_start_timeout_seconds: float = 10.0
 
 
@@ -58,6 +73,7 @@ class DaemonSettings:
     max_concurrency: int = 2
     idle_session_timeout_seconds: float = 3600.0
     reap_interval_seconds: float = 30.0
+    output_log_retention_seconds: float = 7 * 24 * 3600.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,11 +98,6 @@ class InteractionSettings:
 
 
 @dataclass(frozen=True, slots=True)
-class PersistenceSettings:
-    sessions_path: str = field(default_factory=lambda: str(_state_dir() / "sessions.sqlite3"))
-
-
-@dataclass(frozen=True, slots=True)
 class ProcessSettings:
     startup_timeout_seconds: float = 60.0
     turn_timeout_seconds: float = 1800.0
@@ -97,9 +108,8 @@ class ProcessSettings:
 
 @dataclass(frozen=True, slots=True)
 class BufferSettings:
-    max_read_bytes: int = 1024 * 1024
-    max_output_bytes: int = 64 * 1024
-    stdout_overflow_retry_tolerance: int = 1
+    max_read_bytes: int = 100 * 1024 * 1024
+    max_output_bytes: int = 128 * 1024
     stderr_tail_lines: int = 200
 
 
@@ -112,15 +122,28 @@ class LoggingSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class LaunchSettings:
+    ssh_command: str = "ssh"
+    docker_command: str = "docker"
+    codebuddy_command: str = "codebuddy"
+    agy_command: str = "agy_acp_server"
+    codex_command: str = "codex-acp"
+    agy_read_mode_id: str | None = None
+    agy_edit_mode_id: str | None = None
+    agy_auto_mode_id: str | None = None
+    agy_bypass_mode_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class Settings:
     schema_version: int = SCHEMA_VERSION
     ipc: IpcSettings = field(default_factory=IpcSettings)
     daemon: DaemonSettings = field(default_factory=DaemonSettings)
     authentication: AuthenticationSettings = field(default_factory=AuthenticationSettings)
     interaction: InteractionSettings = field(default_factory=InteractionSettings)
-    persistence: PersistenceSettings = field(default_factory=PersistenceSettings)
     process: ProcessSettings = field(default_factory=ProcessSettings)
     buffers: BufferSettings = field(default_factory=BufferSettings)
+    launch: LaunchSettings = field(default_factory=LaunchSettings)
     logging: LoggingSettings = field(default_factory=LoggingSettings)
 
     @property
@@ -136,18 +159,22 @@ _SCHEMA: dict[str, set[str]] = {
         "daemon",
         "authentication",
         "interaction",
-        "persistence",
         "process",
         "buffers",
+        "launch",
         "logging",
     },
     "ipc": {
         "socket_path",
         "lock_path",
-        "connect_timeout_seconds",
         "daemon_start_timeout_seconds",
     },
-    "daemon": {"max_concurrency", "idle_session_timeout_seconds", "reap_interval_seconds"},
+    "daemon": {
+        "max_concurrency",
+        "idle_session_timeout_seconds",
+        "reap_interval_seconds",
+        "output_log_retention_seconds",
+    },
     "authentication": {
         "timeout_seconds",
         "max_concurrent_targets",
@@ -161,7 +188,6 @@ _SCHEMA: dict[str, set[str]] = {
         "window_seconds",
     },
     "interaction": {"timeout_seconds"},
-    "persistence": {"sessions_path"},
     "process": {
         "startup_timeout_seconds",
         "turn_timeout_seconds",
@@ -172,8 +198,12 @@ _SCHEMA: dict[str, set[str]] = {
     "buffers": {
         "max_read_bytes",
         "max_output_bytes",
-        "stdout_overflow_retry_tolerance",
         "stderr_tail_lines",
+    },
+    "launch": {
+        "ssh_command", "docker_command", "codebuddy_command", "agy_command",
+        "codex_command",
+        "agy_read_mode_id", "agy_edit_mode_id", "agy_auto_mode_id", "agy_bypass_mode_id",
     },
     "logging": {"path", "level", "max_bytes", "backup_count"},
 }
@@ -276,6 +306,14 @@ def _path(value: Any, fallback: str, name: str) -> str:
     return str(Path(value).expanduser())
 
 
+def _launch_value(value: Any, fallback: str | None, name: str) -> str | None:
+    if value is None:
+        return fallback
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string or null")
+    return value.strip()
+
+
 def _section(raw: dict[str, Any], name: str) -> dict[str, Any]:
     value = raw.get(name, {})
     if not isinstance(value, dict):
@@ -313,9 +351,9 @@ def load_settings(explicit: str | None = None) -> Settings:
     if not isinstance(rate, dict):
         raise ValueError("authentication.rate_limit must be a mapping")
     interaction = _section(raw, "interaction")
-    persistence = _section(raw, "persistence")
     process = _section(raw, "process")
     buffers = _section(raw, "buffers")
+    launch = _section(raw, "launch")
     logging = _section(raw, "logging")
 
     def positive(section: dict[str, Any], key: str, fallback: int | float) -> float:
@@ -334,9 +372,6 @@ def load_settings(explicit: str | None = None) -> Settings:
         ipc=IpcSettings(
             socket_path=_path(ipc.get("socket_path"), defaults.ipc.socket_path, "ipc.socket_path"),
             lock_path=_path(ipc.get("lock_path"), defaults.ipc.lock_path, "ipc.lock_path"),
-            connect_timeout_seconds=positive(
-                ipc, "connect_timeout_seconds", defaults.ipc.connect_timeout_seconds
-            ),
             daemon_start_timeout_seconds=positive(
                 ipc, "daemon_start_timeout_seconds", defaults.ipc.daemon_start_timeout_seconds
             ),
@@ -352,6 +387,11 @@ def load_settings(explicit: str | None = None) -> Settings:
             ),
             reap_interval_seconds=positive(
                 daemon, "reap_interval_seconds", defaults.daemon.reap_interval_seconds
+            ),
+            output_log_retention_seconds=nonnegative(
+                daemon,
+                "output_log_retention_seconds",
+                defaults.daemon.output_log_retention_seconds,
             ),
         ),
         authentication=AuthenticationSettings(
@@ -388,13 +428,6 @@ def load_settings(explicit: str | None = None) -> Settings:
                 interaction, "timeout_seconds", defaults.interaction.timeout_seconds
             ),
         ),
-        persistence=PersistenceSettings(
-            sessions_path=_path(
-                persistence.get("sessions_path"),
-                defaults.persistence.sessions_path,
-                "persistence.sessions_path",
-            )
-        ),
         process=ProcessSettings(
             startup_timeout_seconds=positive(
                 process, "startup_timeout_seconds", defaults.process.startup_timeout_seconds
@@ -425,15 +458,14 @@ def load_settings(explicit: str | None = None) -> Settings:
                 buffers.get("max_output_bytes", defaults.buffers.max_output_bytes),
                 "buffers.max_output_bytes",
             ),
-            stdout_overflow_retry_tolerance=nonnegative_int(
-                buffers,
-                "stdout_overflow_retry_tolerance",
-                defaults.buffers.stdout_overflow_retry_tolerance,
-            ),
             stderr_tail_lines=positive_int(
                 buffers, "stderr_tail_lines", defaults.buffers.stderr_tail_lines
             ),
         ),
+        launch=LaunchSettings(**{
+            key: _launch_value(launch.get(key), getattr(defaults.launch, key), f"launch.{key}")
+            for key in LaunchSettings.__dataclass_fields__
+        }),
         logging=LoggingSettings(
             path=_path(logging.get("path"), defaults.logging.path, "logging.path"),
             level=str(logging.get("level", defaults.logging.level)).upper(),

@@ -5,6 +5,7 @@ from abc import ABC
 from typing import Any
 
 from .models import AuthInfo, HarnessName, SessionConfig
+from .privacy import public_account
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _DETACH_ARGS = {"--bg", "--background", "--tmux", "--tmux-classic", "--serve"}
@@ -26,7 +27,6 @@ class AuthStatusUnsupported(RuntimeError):
 
 class HarnessAdapter(ABC):
     name: HarnessName
-    default_command: str
 
     def validate(self, config: SessionConfig) -> None:
         if not config.cwd.strip():
@@ -39,6 +39,12 @@ class HarnessAdapter(ABC):
             raise ValueError("ssh_host is required for SSH launch mode")
         if not config.command.strip():
             raise ValueError("command must not be empty")
+        if config.runtime not in {"direct", "docker"}:
+            raise ValueError("runtime must be direct or docker")
+        if config.permission_mode not in {"read", "edit", "auto", "bypass"}:
+            raise ValueError("permission_mode must be read, edit, auto, or bypass")
+        if config.runtime == "docker" and not config.reuse_container and not config.docker_image:
+            raise ValueError(f"Docker image is required for {config.harness} with runtime=docker")
         for name in config.env:
             if not _ENV_NAME.fullmatch(name):
                 raise ValueError(f"invalid environment variable name: {name!r}")
@@ -75,27 +81,21 @@ class HarnessAdapter(ABC):
 
 class CodeBuddyAdapter(HarnessAdapter):
     name: HarnessName = "codebuddy"
-    default_command = "codebuddy"
 
     def validate(self, config: SessionConfig) -> None:
         super().validate(config)
         for value in config.args:
             if value.split("=", 1)[0] in _CODEBUDDY_MANAGED:
                 raise ValueError(f"CodeBuddy argument is managed by the adapter: {value}")
-        mode = config.harness_options.get("permission_mode", "auto")
-        if mode not in {
-            "acceptEdits",
-            "bypassPermissions",
-            "default",
-            "plan",
-            "dontAsk",
-            "auto",
-        }:
-            raise ValueError(f"unsupported CodeBuddy permission mode: {mode!r}")
 
     def build_argv(self, config: SessionConfig) -> list[str]:
         self.validate(config)
-        mode = str(config.harness_options.get("permission_mode", "auto"))
+        mode = {
+            "read": "plan",
+            "edit": "acceptEdits",
+            "auto": "auto",
+            "bypass": "bypassPermissions",
+        }[config.permission_mode]
         return [
             config.command,
             *config.args,
@@ -120,22 +120,31 @@ class CodeBuddyAdapter(HarnessAdapter):
             raise
         result = response.get("result")
         user = result.get("userInfo") if isinstance(result, dict) else None
+        # ``userInfo`` may carry ``token``/``accessToken`` from a real CodeBuddy
+        # harness; only the whitelisted identity fields are exposed. The login
+        # boolean stays tied to the raw object, so a user whose only fields are
+        # redacted credentials is still reported as authenticated.
         return AuthInfo(
             authenticated=isinstance(user, dict) and bool(user),
             methods=methods,
-            user=user if isinstance(user, dict) else None,
+            user=public_account(user),
             raw=result if isinstance(result, dict) else {},
         )
 
 
 class CodexAdapter(HarnessAdapter):
     name: HarnessName = "codex"
-    default_command = "codex-acp"
 
 
 class AgyAdapter(HarnessAdapter):
     name: HarnessName = "agy"
-    default_command = "agy_acp_server"
+
+    def validate(self, config: SessionConfig) -> None:
+        super().validate(config)
+        if config.permission_mode != "auto" and not config.acp_mode_id:
+            raise ValueError(
+                f"launch.agy_{config.permission_mode}_mode_id must be configured"
+            )
 
 
 _ADAPTERS: dict[HarnessName, HarnessAdapter] = {
@@ -150,10 +159,6 @@ def get_adapter(name: HarnessName) -> HarnessAdapter:
         return _ADAPTERS[name]
     except KeyError as exc:  # pragma: no cover - typing normally prevents this
         raise ValueError(f"unsupported harness: {name!r}") from exc
-
-
-def default_command(name: HarnessName) -> str:
-    return get_adapter(name).default_command
 
 
 def _auth_methods(response: dict[str, Any]) -> list[dict[str, Any]]:
@@ -190,6 +195,6 @@ def _normalize_auth_status(
     return AuthInfo(
         authenticated=authenticated,
         methods=methods,
-        user=account if isinstance(account, dict) else None,
+        user=public_account(account),
         raw=candidate,
     )

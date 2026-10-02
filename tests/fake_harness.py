@@ -15,6 +15,13 @@ pending_kind: str | None = None
 pending_auth: int | str | None = None
 child: subprocess.Popen[bytes] | None = None
 
+# Emit a credential-looking line on stderr so callers can prove neither error messages
+# nor the persisted output log echo it back verbatim.
+_stderr_token = os.environ.get("FAKE_STDERR_TOKEN")
+if _stderr_token:
+    sys.stderr.write(f"auth accessToken={_stderr_token}\n")
+    sys.stderr.flush()
+
 pid_file = os.environ.get("FAKE_CHILD_PID_FILE")
 if pid_file:
     child = subprocess.Popen(
@@ -40,6 +47,9 @@ for raw in sys.stdin:
     params = message.get("params") or {}
     request_id = message.get("id")
     if method == "initialize":
+        delay = float(os.environ.get("FAKE_INIT_DELAY", "0"))
+        if delay:
+            time.sleep(delay)
         methods = [] if os.environ.get("FAKE_NO_AUTH") == "1" else [
             {"id": "browser", "name": "Browser"}
         ]
@@ -68,9 +78,16 @@ for raw in sys.stdin:
             if authenticated
             else {"kind": "none"}
         )
+        status_token = os.environ.get("FAKE_STATUS_TOKEN")
+        if status_token and isinstance(status.get("account"), dict):
+            status["account"]["accessToken"] = status_token
         send({"jsonrpc": "2.0", "id": request_id, "result": {"authStatus": status}})
     elif method == "_codebuddy.ai/getUserInfo":
         user = {"userId": "fake-user"} if authenticated else None
+        user_token = os.environ.get("FAKE_USER_TOKEN")
+        if user is not None and user_token:
+            user["token"] = user_token
+            user["accessToken"] = user_token
         send({"jsonrpc": "2.0", "id": request_id, "result": {"userInfo": user}})
     elif method == "authenticate":
         if os.environ.get("FAKE_AUTH_INTERACTION") == "1":
@@ -112,8 +129,38 @@ for raw in sys.stdin:
     elif method == "session/set_model":
         current_model = params["modelId"]
         send({"jsonrpc": "2.0", "id": request_id, "result": {"modelId": current_model}})
+    elif method == "session/set_config_option":
+        if os.environ.get("FAKE_MODE_LOG"):
+            with open(os.environ["FAKE_MODE_LOG"], "a", encoding="utf-8") as output:
+                output.write(json.dumps(params) + "\n")
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"configOptions": []}})
+    elif method == "session/set_mode":
+        if os.environ.get("FAKE_MODE_LOG"):
+            with open(os.environ["FAKE_MODE_LOG"], "a", encoding="utf-8") as output:
+                output.write(json.dumps(params) + "\n")
+        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
     elif method == "session/prompt":
         text = params["prompt"][0]["text"]
+        if text == "oversize_flood":
+            pending_prompt = request_id
+            pending_kind = "flood"
+            count = int(os.environ.get("FAKE_OVERSIZE_FLOOD_LINES", "100"))
+            size = int(os.environ.get("FAKE_OVERSIZE_BYTES", "4096"))
+            for index in range(count):
+                send(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": session_id,
+                            "update": {
+                                "sessionUpdate": "agent_message_chunk",
+                                "content": {"type": "text", "text": f"{index}:" + "x" * size},
+                            },
+                        },
+                    }
+                )
+            continue
         send(
             {
                 "jsonrpc": "2.0",
@@ -127,9 +174,12 @@ for raw in sys.stdin:
                 },
             }
         )
-        if text == "permission":
+        if text in {"permission", "oversize_permission"}:
             pending_prompt = request_id
             pending_kind = "permission"
+            padding = ""
+            if text == "oversize_permission":
+                padding = "x" * int(os.environ.get("FAKE_OVERSIZE_BYTES", "4000"))
             send(
                 {
                     "jsonrpc": "2.0",
@@ -137,7 +187,13 @@ for raw in sys.stdin:
                     "method": "session/request_permission",
                     "params": {
                         "sessionId": session_id,
-                        "toolCall": {"title": "Command", "rawInput": {"command": "printf ok"}},
+                        "toolCall": {
+                            "title": "Command",
+                            "rawInput": {
+                                "command": "printf ok",
+                                "padding": padding,
+                            },
+                        },
                         "options": [
                             {"kind": "allow", "name": "Allow", "optionId": "allow"},
                             {"kind": "reject", "name": "Deny", "optionId": "deny"},
@@ -204,6 +260,9 @@ for raw in sys.stdin:
                 },
             }
         )
+        if os.environ.get("FAKE_INTERACTION_HANG") == "1":
+            # Deliberately leave the prompt unanswered until session/cancel arrives.
+            continue
         send(
             {
                 "jsonrpc": "2.0",
@@ -213,12 +272,17 @@ for raw in sys.stdin:
         )
         pending_prompt = None
         pending_kind = None
-    elif method == "session/cancel" and pending_prompt is not None:
-        send(
-            {
-                "jsonrpc": "2.0",
-                "id": pending_prompt,
-                "result": {"stopReason": "cancelled"},
-            }
-        )
-        pending_prompt = None
+    elif method == "session/cancel":
+        cancel_log = os.environ.get("FAKE_CANCEL_LOG")
+        if cancel_log:
+            with open(cancel_log, "a", encoding="utf-8") as output:
+                output.write("cancel\n")
+        if pending_prompt is not None:
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": pending_prompt,
+                    "result": {"stopReason": "cancelled"},
+                }
+            )
+            pending_prompt = None

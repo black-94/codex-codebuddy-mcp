@@ -3,13 +3,13 @@ schema_version: 1
 ipc:
   socket_path: null
   lock_path: null
-  connect_timeout_seconds: 2
   daemon_start_timeout_seconds: 10
 
 daemon:
   max_concurrency: 2
   idle_session_timeout_seconds: 3600
   reap_interval_seconds: 30
+  output_log_retention_seconds: 604800
 
 authentication:
   timeout_seconds: 600
@@ -24,9 +24,6 @@ authentication:
 interaction:
   timeout_seconds: 900
 
-persistence:
-  sessions_path: null
-
 process:
   startup_timeout_seconds: 60
   turn_timeout_seconds: 1800
@@ -35,10 +32,20 @@ process:
   remote_cleanup_timeout_seconds: 10
 
 buffers:
-  max_read_bytes: 1MiB
-  max_output_bytes: 64KiB
-  stdout_overflow_retry_tolerance: 1
+  max_read_bytes: 100MiB
+  max_output_bytes: 128KiB
   stderr_tail_lines: 200
+
+launch:
+  ssh_command: ssh
+  docker_command: docker
+  codebuddy_command: codebuddy
+  agy_command: agy_acp_server
+  codex_command: codex-acp
+  agy_read_mode_id: null
+  agy_edit_mode_id: null
+  agy_auto_mode_id: null
+  agy_bypass_mode_id: null
 
 logging:
   path: null

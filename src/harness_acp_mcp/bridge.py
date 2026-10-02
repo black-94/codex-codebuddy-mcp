@@ -12,12 +12,12 @@ from .acp import AcpClient, AcpError
 from .auth_store import AuthRateStore
 from .config import Settings
 from .models import InteractionRequest, SessionConfig
+from .output_log import HarnessOutputLog, daemon_directory
 
 
 @dataclass(slots=True)
 class BridgeSession:
     session_id: str
-    record_id: str
     config: SessionConfig
     client: AcpClient
     lock: asyncio.Lock
@@ -47,7 +47,6 @@ class SessionRegistry:
         session_id = uuid.uuid4().hex
         session = BridgeSession(
             session_id=session_id,
-            record_id=uuid.uuid4().hex,
             config=config,
             client=AcpClient(config),
             lock=asyncio.Lock(),
@@ -229,6 +228,42 @@ class SessionRegistry:
             *(self.cleanup_output_paths(session) for session in sessions),
             return_exceptions=True,
         )
+
+    async def sweep_output_logs(self) -> int:
+        """Delete preserved output logs older than the configured retention.
+
+        Only this daemon's own log directory is scanned, so concurrent daemons that
+        share the system temporary directory never sweep each other's logs. Logs of
+        live sessions are never removed, regardless of age, and a log is not removed
+        when its session closes: retention is measured from the last write, so a
+        just-closed session's file stays available for manual follow-up.
+        """
+        retention = self.settings.daemon.output_log_retention_seconds
+        if retention <= 0:
+            return 0
+        async with self._lock:
+            active = {
+                str(session.client.output_log.path) for session in self._sessions.values()
+            }
+        identity = self.settings.ipc.lock_path
+        cutoff = time.time() - retention
+
+        def sweep() -> int:
+            directory = daemon_directory(identity)
+            removed = 0
+            for path in directory.glob(HarnessOutputLog.FILE_GLOB):
+                if str(path) in active:
+                    continue
+                try:
+                    if path.stat().st_mtime >= cutoff:
+                        continue
+                    path.unlink()
+                except OSError:
+                    continue
+                removed += 1
+            return removed
+
+        return await asyncio.to_thread(sweep)
 
     @staticmethod
     async def cleanup_output_paths(session: BridgeSession) -> None:

@@ -8,8 +8,13 @@ from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.types import CallToolResult, TextContent
 
-from .config import load_settings
+from .config import (
+    CREATE_SESSION_IPC_GRACE_SECONDS,
+    create_session_timeout_seconds,
+    load_settings,
+)
 from .ipc import DaemonClient
 
 logger = logging.getLogger(__name__)
@@ -29,6 +34,28 @@ mcp = FastMCP("harness-acp-mcp", lifespan=lifespan, json_response=True)
 def _supports_elicitation(ctx: Context) -> bool:
     params = getattr(ctx.session, "client_params", None)
     return bool(params and getattr(params.capabilities, "elicitation", None) is not None)
+
+
+def _tool_result(result: dict[str, Any]) -> Any:
+    """Expose application-level errors as MCP errors without losing the JSON payload.
+
+    The daemon reports recoverable ACP failures as a normal result with
+    ``status: "error"``. Returning that as a bare dict would make MCP clients see
+    ``isError: false``. Wrapping it in a ``CallToolResult`` keeps the structured English
+    JSON available while setting ``isError: true``.
+    """
+    if result.get("status") != "error":
+        return result
+    return CallToolResult(
+        isError=True,
+        content=[
+            TextContent(
+                type="text",
+                text=json.dumps(result, ensure_ascii=False, sort_keys=True),
+            )
+        ],
+        structuredContent=result,
+    )
 
 
 async def _resolve_cwd(ctx: Context, cwd: str) -> str:
@@ -162,49 +189,48 @@ async def create_session(
     cwd: str,
     model_id: str,
     ctx: Context,
-    launch_mode: Literal["local", "ssh"] = "local",
-    command: str | None = None,
-    args: list[str] | None = None,
-    env: dict[str, str] | None = None,
-    ssh_host: str | None = None,
-    ssh_command: str = "ssh",
-    ssh_args: list[str] | None = None,
+    target: Literal["local", "remote"] = "local",
+    remote_host: str | None = None,
+    runtime: Literal["direct", "docker"] = "direct",
+    permission_mode: Literal["read", "edit", "auto", "bypass"] = "auto",
+    container_policy: Literal["remove", "keep"] | None = None,
+    docker_id: str | None = None,
+    docker_image: str | None = None,
+    mounts: list[dict[str, Any]] | None = None,
+    ports: list[dict[str, Any]] | None = None,
+    host_network: bool = False,
     resume_session_id: str | None = None,
-    resume_record_id: str | None = None,
-    harness_options: dict[str, Any] | None = None,
     startup_timeout_seconds: float | None = None,
     auth_timeout_seconds: float | None = None,
-    max_read_bytes: int | None = None,
-    max_output_bytes: int | None = None,
 ) -> dict[str, Any]:
-    """Launch one local or SSH ACP harness and initialize its session."""
+    """Launch an ACP harness locally or remotely, directly or in Docker."""
     if not isinstance(model_id, str) or not model_id.strip():
         raise ValueError("model_id must not be empty")
     params: dict[str, Any] = {
         "harness": harness,
         "cwd": await _resolve_cwd(ctx, cwd),
         "model_id": model_id.strip(),
-        "launch_mode": launch_mode,
-        "command": command,
-        "args": list(args or []),
-        "env": dict(env or {}),
-        "ssh_host": ssh_host,
-        "ssh_command": ssh_command,
-        "ssh_args": list(ssh_args or []),
+        "target": target,
+        "remote_host": remote_host,
+        "runtime": runtime,
+        "permission_mode": permission_mode,
+        "container_policy": container_policy,
+        "docker_id": docker_id,
+        "docker_image": docker_image,
+        "mounts": mounts,
+        "ports": ports,
+        "host_network": host_network,
         "resume_session_id": resume_session_id,
-        "resume_record_id": resume_record_id,
-        "harness_options": dict(harness_options or {}),
     }
     for key, value in (
         ("startup_timeout_seconds", startup_timeout_seconds),
         ("auth_timeout_seconds", auth_timeout_seconds),
-        ("max_read_bytes", max_read_bytes),
-        ("max_output_bytes", max_output_bytes),
     ):
         if value is not None:
             params[key] = value
-    timeout = (startup_timeout_seconds or SETTINGS.process.startup_timeout_seconds) + 30
-    return await daemon.call("create_session", params, request_timeout=timeout)
+    startup = startup_timeout_seconds or SETTINGS.process.startup_timeout_seconds
+    timeout = create_session_timeout_seconds(startup) + CREATE_SESSION_IPC_GRACE_SECONDS
+    return _tool_result(await daemon.call("create_session", params, request_timeout=timeout))
 
 
 @mcp.tool()
@@ -215,19 +241,23 @@ async def authenticate(session_id: str, method_id: str, ctx: Context) -> dict[st
         {"session_id": session_id, "method_id": method_id},
         request_timeout=SETTINGS.authentication.timeout_seconds + 30,
     )
-    return await _prefer_elicitation(ctx, result, SETTINGS.authentication.timeout_seconds)
+    return _tool_result(
+        await _prefer_elicitation(ctx, result, SETTINGS.authentication.timeout_seconds)
+    )
 
 
 @mcp.tool()
 async def get_user_info(session_id: str) -> dict[str, Any]:
     """Return a reliable login boolean and optional harness account details."""
-    return await daemon.call("get_user_info", {"session_id": session_id})
+    return _tool_result(await daemon.call("get_user_info", {"session_id": session_id}))
 
 
 @mcp.tool()
 async def set_model(session_id: str, model_id: str) -> dict[str, Any]:
     """Change the model for a ready harness session between turns."""
-    return await daemon.call("set_model", {"session_id": session_id, "model_id": model_id})
+    return _tool_result(
+        await daemon.call("set_model", {"session_id": session_id, "model_id": model_id})
+    )
 
 
 @mcp.tool()
@@ -236,7 +266,6 @@ async def prompt(
     prompt: str,
     ctx: Context,
     timeout_seconds: float = SETTINGS.process.turn_timeout_seconds,
-    max_output_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Run a harness turn, preferring MCP elicitation for all interactions."""
     params: dict[str, Any] = {
@@ -244,12 +273,10 @@ async def prompt(
         "prompt": prompt,
         "timeout_seconds": timeout_seconds,
     }
-    if max_output_bytes is not None:
-        params["max_output_bytes"] = max_output_bytes
     result = await daemon.call(
         "prompt", params, request_timeout=timeout_seconds + 30
     )
-    return await _prefer_elicitation(ctx, result, timeout_seconds)
+    return _tool_result(await _prefer_elicitation(ctx, result, timeout_seconds))
 
 
 @mcp.tool()
@@ -259,7 +286,6 @@ async def respond_interaction(
     response: dict[str, Any],
     ctx: Context,
     timeout_seconds: float = SETTINGS.process.turn_timeout_seconds,
-    max_output_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Answer a pending permission or information request and continue the turn."""
     params: dict[str, Any] = {
@@ -268,24 +294,22 @@ async def respond_interaction(
         "response": response,
         "timeout_seconds": timeout_seconds,
     }
-    if max_output_bytes is not None:
-        params["max_output_bytes"] = max_output_bytes
     result = await daemon.call(
         "respond_interaction", params, request_timeout=timeout_seconds + 30
     )
-    return await _prefer_elicitation(ctx, result, timeout_seconds)
+    return _tool_result(await _prefer_elicitation(ctx, result, timeout_seconds))
 
 
 @mcp.tool()
 async def cancel_turn(session_id: str) -> dict[str, Any]:
     """Cancel the current turn while keeping the harness session available."""
-    return await daemon.call("cancel_turn", {"session_id": session_id})
+    return _tool_result(await daemon.call("cancel_turn", {"session_id": session_id}))
 
 
 @mcp.tool()
 async def close_session(session_id: str) -> dict[str, Any]:
     """Close the session supervisor and its complete harness process group."""
-    return await daemon.call("close_session", {"session_id": session_id})
+    return _tool_result(await daemon.call("close_session", {"session_id": session_id}))
 
 
 def main() -> None:

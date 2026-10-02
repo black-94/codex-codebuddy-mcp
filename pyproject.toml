@@ -1,14 +1,28 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
 name = "harness-acp-mcp"
-version = "0.2.0"
+dynamic = ["version"]
 description = "An isolated MCP bridge for local and SSH ACP harness processes"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["mcp", "acp", "agents", "codebuddy", "codex"]
+classifiers = [
+  "Environment :: Console",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS :: MacOS X",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development",
+]
 dependencies = [
   "mcp>=1.30,<2",
 ]
@@ -24,8 +38,26 @@ dev = [
   "ruff>=0.11",
 ]
 
+[tool.hatch.version]
+path = "src/harness_acp_mcp/__init__.py"
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src/harness_acp_mcp/*.py",
+  "/tests/*.py",
+  "/tools/*.py",
+  "/docs/*.md",
+  "/.gitignore",
+  "/README.md",
+  "/LICENSE",
+  "/config.example.yaml",
+  "/pyproject.toml",
+  "/uv.lock",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/harness_acp_mcp"]
+exclude = ["__pycache__", "*.pyc"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

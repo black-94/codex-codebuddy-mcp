@@ -8,7 +8,14 @@ from pathlib import Path
 
 import pytest
 
-from harness_acp_mcp.acp import AcpClient, AcpError
+from harness_acp_mcp.acp import (
+    MAX_CONSECUTIVE_OVERSIZED_LINES,
+    AcpClient,
+    AcpDiscardLimitExceeded,
+    AcpError,
+    AcpLineTooLarge,
+    _readline_discarding_overflow,
+)
 from harness_acp_mcp.adapters import _normalize_auth_status, get_adapter
 from harness_acp_mcp.models import SessionConfig
 from harness_acp_mcp.supervisor import _cleanup_remote, _remote_command
@@ -47,6 +54,96 @@ async def test_generic_transport_auth_session_model_and_prompt(tmp_path: Path) -
         await client.begin_prompt("hello")
         event = await client.wait_for_turn_event(5)
         assert event["kind"] == "complete"
+        assert event["result"]["text"] == "echo:hello"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_only_the_oversized_line_is_discarded() -> None:
+    reader = asyncio.StreamReader(limit=64)
+    reader.feed_data(b"x" * 256)  # no newline yet, so the line exceeds the read limit
+    task = asyncio.create_task(_readline_discarding_overflow(reader))
+    reader.feed_data(b"\n" + b'{"jsonrpc":"2.0","id":1}\n' + b"tail\n")
+    reader.feed_eof()
+
+    discarded, overflowed = await task
+    assert overflowed is True
+    assert discarded == b""
+    following, overflowed = await _readline_discarding_overflow(reader)
+    assert overflowed is False
+    assert following == b'{"jsonrpc":"2.0","id":1}\n'
+    last, overflowed = await _readline_discarding_overflow(reader)
+    assert overflowed is False
+    assert last == b"tail\n"
+
+
+@pytest.mark.asyncio
+async def test_single_line_over_discard_budget_closes_transport() -> None:
+    reader = asyncio.StreamReader(limit=64)
+    reader.feed_data(b"x" * 8192)
+    reader.feed_eof()
+
+    with pytest.raises(AcpDiscardLimitExceeded, match="bounded discard budget"):
+        await _readline_discarding_overflow(reader, max_discard_bytes=256)
+
+
+@pytest.mark.asyncio
+async def test_consecutive_oversized_lines_are_bounded(tmp_path: Path) -> None:
+    config = fake_config(tmp_path)
+    config.max_read_bytes = 1024
+    config.env["FAKE_OVERSIZE_FLOOD_LINES"] = str(MAX_CONSECUTIVE_OVERSIZED_LINES + 1)
+    config.env["FAKE_OVERSIZE_BYTES"] = "4096"
+    client = AcpClient(config)
+    await client.start_transport()
+    await client.open_session()
+    try:
+        await client.begin_prompt("oversize_flood")
+        with pytest.raises(AcpLineTooLarge):
+            await client.wait_for_turn_event(5)
+
+        # The reader keeps discarding the flood, but stops at the bound and closes the
+        # transport instead of spinning forever.
+        for _ in range(200):
+            if not client.running:
+                break
+            await asyncio.sleep(0.02)
+        assert not client.running
+        contents = await asyncio.to_thread(client.output_log.path.read_text)
+        discards = contents.count("exceeded max_read_bytes and was discarded")
+        assert 0 < discards <= MAX_CONSECUTIVE_OVERSIZED_LINES
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_oversized_line_cancels_turn_and_client_stays_usable(tmp_path: Path) -> None:
+    cancel_log = tmp_path / "cancels.txt"
+    config = fake_config(tmp_path)
+    config.max_read_bytes = 1024
+    config.env["FAKE_CANCEL_LOG"] = str(cancel_log)
+    client = AcpClient(config)
+    await client.start_transport()
+    await client.open_session()
+    try:
+        await client.begin_prompt("oversize_permission")
+        with pytest.raises(AcpLineTooLarge) as failure:
+            await client.wait_for_turn_event(5)
+        assert failure.value.limit == 1024
+        assert failure.value.turn_active is True
+        assert failure.value.as_error()["turn_cancelled"] == "best_effort"
+        assert not client.turn_active
+        assert client.pending_interaction is None
+        cancels = ""
+        for _ in range(100):
+            cancels = cancel_log.read_text(encoding="utf-8") if cancel_log.exists() else ""
+            if cancels == "cancel\n":
+                break
+            await asyncio.sleep(0.02)
+        assert cancels == "cancel\n"
+
+        await client.begin_prompt("hello")
+        event = await client.wait_for_turn_event(5)
         assert event["result"]["text"] == "echo:hello"
     finally:
         await client.close()
@@ -177,7 +274,6 @@ def _remote_spec(tmp_path: Path) -> dict:
         "terminate_grace_seconds": 0.01,
         "remote_cleanup_timeout_seconds": 1,
         "ssh_command": "ssh",
-        "ssh_args": [],
         "ssh_host": "placeholder.invalid",
     }
 
@@ -199,8 +295,10 @@ async def test_remote_wrapper_keeps_stdio_open_until_harness_exits(tmp_path: Pat
     command = _remote_command(_remote_spec(tmp_path))
     env = os.environ.copy()
     env["TMPDIR"] = str(tmp_path)
+    # The SSH login shell must support non-interactive job control (e.g. Bash).
+    # Linux /bin/sh is commonly dash, which cannot provide that lifecycle contract.
     process = await asyncio.create_subprocess_exec(
-        "/bin/sh",
+        "/bin/bash",
         "-c",
         command,
         env=env,

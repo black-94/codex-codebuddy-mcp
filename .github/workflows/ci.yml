@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run --locked ruff check .
+      - run: uv run --locked pytest -m "not real_codebuddy and not real_codex and not model"
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+      - run: uv build --no-sources
+      - run: uv run --no-project python tools/check_dist.py dist
+      - run: uvx --from twine twine check --strict dist/*
+      - name: Check wheel installation outside the source tree
+        run: |
+          uv venv .venv-release
+          uv pip install --python .venv-release/bin/python dist/*.whl
+          .venv-release/bin/python -I tools/smoke_install.py
+      - name: Rebuild and check the source distribution
+        run: |
+          uv build dist/*.tar.gz --wheel --out-dir dist/rebuilt --no-sources
+          uv pip install --python .venv-release/bin/python --reinstall --no-deps dist/rebuilt/*.whl
+          .venv-release/bin/python -I tools/smoke_install.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+          if-no-files-found: error
